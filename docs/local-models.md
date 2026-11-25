@@ -31,7 +31,8 @@ python3 comfy_agent.py config unload_llm="curl -sf http://127.0.0.1:8080/unload"
 If your llama-swap has an API key: `unload_llm="curl -sf -H 'Authorization: Bearer YOUR-KEY' http://127.0.0.1:8080/unload"`.
 
 A Qwen3.8 27B entry for a 16 GB card. The 3-bit file is 13.4 GB and its vision part 0.9 GB, so the context
-has to be smaller than on a 32 GB card:
+has to be smaller than on a 32 GB card. Leave the MTP draft (`--spec-type draft-mtp`) off: it adds about
+570 MiB. With this entry, nvidia-smi showed the model using 14,976 MiB:
 
 ```yaml
 models:
@@ -40,7 +41,7 @@ models:
       llama-server --host 127.0.0.1 --port ${PORT}
       -ngl 999 -fa on -np 1 --no-context-shift
       --cache-type-k q4_0 --cache-type-v q4_0 -b 2048 -ub 512
-      --spec-type draft-mtp --spec-draft-n-max 2 --reasoning-format deepseek
+      --reasoning-format deepseek
       -m /path/to/Qwen3.8-27B-UD-Q3_K_XL.gguf --mmproj /path/to/mmproj-BF16.gguf
       -c 32768
 ```
@@ -81,10 +82,27 @@ python3 comfy_agent.py config unload_llm=
 Then either install the kit as a skill (see the README) or add its MCP server to `~/.pi/agent/mcp.json`
 ([chat-apps.md](chat-apps.md)). The MCP route used the fewest tokens in our tests ([tokens.md](tokens.md)).
 
+## What we measured
+
+pi with the entry above, the kit's MCP server and this request: "Make 2 pictures of a red fox asleep in the
+snow at dawn with my ComfyUI. Then take the better one and make it night time with a full moon." The card was
+a 32 GB RTX 5090 with ComfyUI started with `--reserve-vram 17.5`, so ComfyUI had about as much room as on a
+16 GB card.
+
+- It finished in 148 seconds with 9 model calls and 4 ComfyUI jobs.
+- Sampled every half second, the model and a working ComfyUI were never on the card at the same time.
+- The most the two used together was 15,976 MiB: the model peaked at 15,126 MiB and ComfyUI at 15,296 MiB.
+
+This was a big card made to act like a small one, and your desktop uses some of a real 16 GB card too. If the
+model fails to load after a picture, lower `-c` to 16384, which saved about 450 MiB in our tests.
+
 ## Things to know
 
 - In this mode `run` always waits for its results, even with `--no-wait`: if the agent took another turn
   while ComfyUI was still rendering, the model would load back into a full card. For long videos, raise
   `--timeout` (seconds, default 600).
 - The MCP `generate` tool waits up to 30 minutes in this mode instead of 4.
+- Qwen3.8 27B sometimes sees problems that aren't there. In two of our runs it said a sleeping fox had two
+  heads and made more pictures; every fox had one head. If it starts redoing work, ask it to show you the
+  pictures and let you judge.
 - There's nothing to unload with a cloud model (Claude, Codex, ChatGPT), so leave `unload_llm` empty for those.
