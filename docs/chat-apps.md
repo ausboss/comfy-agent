@@ -56,23 +56,24 @@ only like this:
 2. Publish just that port with Tailscale Funnel:
 
    ```bash
-   tailscale serve status          # see which ports you already use
-   tailscale funnel --bg --https=10000 http://127.0.0.1:8765
+   tailscale serve status          # see what you already serve on 443
+   tailscale funnel --bg http://127.0.0.1:8765
    ```
 
-   Funnel only works on ports 443, 8443 and 10000, and it opens the whole port to the internet, including
-   anything Tailscale Serve already has on it. Pick one that `tailscale serve status` doesn't list. Never funnel ComfyUI's own
-   port (8188): its API can install code and read files.
+   Claude only connects to port 443 (its help page: "Claude can't connect to a URL that specifies another
+   port"). Funnel opens the whole port to the internet, including anything Tailscale Serve already has on it,
+   so if `tailscale serve status` lists something on 443, don't do this on that machine. Never funnel
+   ComfyUI's own port (8188): its API can install code and read files.
 
 3. Add the connector:
    - **Claude** (claude.ai on the web: Settings > Connectors > Add custom connector):
-     `https://YOUR-PC.YOUR-TAILNET.ts.net:10000/mcp/THE-SECRET`. Connectors you add on the web also show up in
+     `https://YOUR-PC.YOUR-TAILNET.ts.net/mcp/THE-SECRET`. Connectors you add on the web also show up in
      the phone app.
    - **ChatGPT** (on the web, add a custom MCP server in the plugins/connectors settings). Check your plan
-     first: as of November 2026, OpenAI documents full custom MCP servers for Business, Enterprise and Edu
-     workspaces, and read/fetch-only access for Pro.
+     first: as of November 2026, OpenAI documents custom MCP servers only for Business, Enterprise and Edu
+     workspaces.
 
-4. Turn it off when you're done: `tailscale funnel --https=10000 off`.
+4. Turn it off when you're done: `tailscale funnel --https=443 off`.
 
 What to expect:
 
