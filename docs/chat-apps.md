@@ -37,9 +37,39 @@ pi (`~/.pi/agent/mcp.json`):
 For these agents the CLI with `SKILL.md` costs about the same and also covers installing and making recipes,
 so the MCP server is optional.
 
-## Claude and ChatGPT apps (remote MCP)
+## Claude Desktop and the ChatGPT app on the same computer (stdio)
 
-These apps call your MCP server from their own cloud, not from your phone, so the server needs a public HTTPS
+When the app runs on the computer that runs ComfyUI, it starts the kit itself. You don't need a public address.
+
+Claude Desktop: add this to `claude_desktop_config.json` and restart the app. It's in `~/.config/Claude/` on
+Linux, `~/Library/Application Support/Claude/` on macOS and `%APPDATA%\Claude\` on Windows.
+
+```json
+{"mcpServers": {"comfy": {"command": "python3", "args": ["/path/to/comfy-agent/comfy_agent.py", "mcp"]}}}
+```
+
+The ChatGPT app's Codex side, set to "This computer", reads `~/.codex/config.toml`, so the Codex lines above
+work there. The first call asks "Allow the comfy MCP server to run tool ...". Pick Always allow, or add this:
+
+```toml
+[mcp_servers.comfy.tools.recipes]
+approval_mode = "approve"
+
+[mcp_servers.comfy.tools.generate]
+approval_mode = "approve"
+
+[mcp_servers.comfy.tools.results]
+approval_mode = "approve"
+```
+
+Don't set `approval_policy = "never"` for this: the app then turns the tool call down instead of asking.
+
+We tested both on Linux, in fresh app profiles, in November 2026. Asked in plain English for 2 pictures, each app
+called `generate`, showed the pictures in the chat and gave the file paths.
+
+## Claude and ChatGPT apps on a phone or another computer (remote MCP)
+
+From a phone or another computer, these apps call your MCP server from their own cloud, so the server needs a public HTTPS
 address. Being on your tailnet isn't enough. That means putting a door to your GPU on the internet. Do it
 only like this:
 

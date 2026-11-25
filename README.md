@@ -95,9 +95,10 @@ Setup for llama-swap, LM Studio and Ollama, and what it costs in time: [docs/loc
 ## ChatGPT and Claude apps
 
 `comfy_agent.py mcp` is the same thing as an MCP server with three tools (`recipes`, `generate`,
-`results`). For Claude Code, Codex or pi it runs over stdio. For the Claude and ChatGPT apps, on your
-computer or your phone, it needs a public HTTPS address, so it runs behind Tailscale Funnel with a secret. Read
-[docs/chat-apps.md](docs/chat-apps.md) before you do that: it puts your GPU on the internet.
+`results`). For Claude Code, Codex or pi it runs over stdio. Claude Desktop and the ChatGPT app on the computer that runs
+ComfyUI can start it the same way. On a phone or another computer, the apps need a public HTTPS address, so
+it runs behind Tailscale Funnel with a secret. Read [docs/chat-apps.md](docs/chat-apps.md) before you do that:
+it puts your GPU on the internet.
 
 ## Your own workflows
 
