@@ -1,0 +1,52 @@
+{
+ "title": "Z-Image Turbo: picture from words",
+ "does": "A photo-real or illustrated picture from one plain sentence. Fast: a few seconds each on a big GPU, about 12 GB of VRAM.",
+ "inputs": {
+  "prompt": {
+   "set": "57:27.text",
+   "required": true,
+   "help": "what the picture shows, in plain sentences"
+  },
+  "seed": {
+   "set": [
+    "57:3.seed"
+   ],
+   "default": "random",
+   "help": "same seed and settings give the same result"
+  },
+  "width": {
+   "set": "57:13.width",
+   "default": 1024,
+   "help": "pixels, a multiple of 64"
+  },
+  "height": {
+   "set": "57:13.height",
+   "default": 1024,
+   "help": "pixels, a multiple of 64"
+  }
+ },
+ "tips": [
+  "Describe the subject, what it does, the setting, the light and the camera. Concrete words beat quality words like 8k or masterpiece.",
+  "Put any text that must appear in the picture in quotes."
+ ],
+ "needs": {
+  "nodes": [],
+  "models": [
+   {
+    "file": "qwen_3_4b.safetensors",
+    "folder": "text_encoders",
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+   },
+   {
+    "file": "ae.safetensors",
+    "folder": "vae",
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
+   },
+   {
+    "file": "z_image_turbo_bf16.safetensors",
+    "folder": "diffusion_models",
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors"
+   }
+  ]
+ }
+}

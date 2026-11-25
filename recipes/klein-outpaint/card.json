@@ -1,0 +1,85 @@
+{
+ "title": "Klein 9B Outpaint (AusBoss): make a picture bigger",
+ "does": "Extends a picture past its edges: give the pixels to add on each side and it paints a seamless continuation, then puts your picture back on top. From AusBoss's workflow of the same name on Civitai.",
+ "inputs": {
+  "image": {
+   "set": "26.image",
+   "type": "image",
+   "required": true,
+   "help": "the picture to extend"
+  },
+  "left": {
+   "set": "26.pad_left",
+   "default": 0,
+   "help": "pixels to add on the left"
+  },
+  "right": {
+   "set": "26.pad_right",
+   "default": 0,
+   "help": "pixels to add on the right"
+  },
+  "top": {
+   "set": "26.pad_top",
+   "default": 0,
+   "help": "pixels to add on top"
+  },
+  "bottom": {
+   "set": "26.pad_bottom",
+   "default": 0,
+   "help": "pixels to add at the bottom"
+  },
+  "seed": {
+   "set": [
+    "13.seed"
+   ],
+   "default": "random",
+   "help": "same seed and settings give the same result"
+  }
+ },
+ "tips": [
+  "To turn a square picture into a wide one, add about half its width to left and right together, split evenly.",
+  "At least one side must be more than 0, or nothing changes."
+ ],
+ "needs": {
+  "nodes": [
+   {
+    "id": "ausboss-nodes",
+    "classes": [
+     "AUSBOSS_NODES_Compare",
+     "AUSBOSS_NODES_ImageCropRotatePad",
+     "AUSBOSS_NODES_LoraLoader",
+     "AUSBOSS_NODES_RunTimer",
+     "AUSBOSS_NODES_SaveImage",
+     "AUSBOSS_NODES_Seed",
+     "AUSBOSS_NODES_ShowText",
+     "AUSBOSS_NODES_StitchInpaint",
+     "AUSBOSS_NODES_Text",
+     "AUSBOSS_NODES_WorkflowNote"
+    ],
+    "repo": "https://github.com/ausboss/ComfyUI-AusBoss.git"
+   }
+  ],
+  "models": [
+   {
+    "file": "flux-2-klein-9b-int8-convrot.safetensors",
+    "folder": "diffusion_models",
+    "url": "https://huggingface.co/Winnougan/Klein9b-Distilled-Base-INT8-Convrot/resolve/main/flux-2-klein-9b-int8-convrot.safetensors"
+   },
+   {
+    "file": "qwen_3_8b_fp8mixed.safetensors",
+    "folder": "text_encoders",
+    "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors"
+   },
+   {
+    "file": "flux2-vae.safetensors",
+    "folder": "vae",
+    "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors"
+   },
+   {
+    "file": "qwen3vl_8b_int8_convrot.safetensors",
+    "folder": "text_encoders",
+    "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+   }
+  ]
+ }
+}

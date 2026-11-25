@@ -1,0 +1,423 @@
+{
+ "52": {
+  "inputs": {
+   "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "class_type": "UNETLoader",
+  "_meta": {
+   "title": "Diffusion model"
+  }
+ },
+ "53": {
+  "inputs": {
+   "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "class_type": "CLIPLoader",
+  "_meta": {
+   "title": "Text encoder"
+  }
+ },
+ "54": {
+  "inputs": {
+   "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "VAE"
+  }
+ },
+ "74": {
+  "inputs": {
+   "loras": "[{\"name\": \"qwen-image-2.1-consistency.safetensors\", \"strength\": 1, \"enabled\": false, \"triggers\": \"\"}]",
+   "trigger_separator": ", ",
+   "on_missing": "error",
+   "model": [
+    "52",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_LoraLoader",
+  "_meta": {
+   "title": "LoRA Loader - Consistency LoRA"
+  }
+ },
+ "56": {
+  "inputs": {
+   "image": ""
+  },
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "Your image"
+  }
+ },
+ "58": {
+  "inputs": {
+   "text": "make it a soft watercolor painting"
+  },
+  "class_type": "AUSBOSS_NODES_Text",
+  "_meta": {
+   "title": "Text - Your edit"
+  }
+ },
+ "60": {
+  "inputs": {
+   "seed": 26092702
+  },
+  "class_type": "AUSBOSS_NODES_Seed",
+  "_meta": {
+   "title": "Seed"
+  }
+ },
+ "75:57": {
+  "inputs": {
+   "target_mode": "megapixels",
+   "width": 0,
+   "height": 0,
+   "edge_length": 1024,
+   "megapixels": 1,
+   "scale_factor": 0.5,
+   "keep_proportion": "fit",
+   "fill_color": "#000000",
+   "divisible_by": 32,
+   "interpolation": "lanczos",
+   "image": [
+    "75:87",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_ImageResize",
+  "_meta": {
+   "title": "Image Resize - About 1 MP"
+  }
+ },
+ "75:70": {
+  "inputs": {
+   "text": "You are an image-edit prompt writer.\n\nYou receive:\n1. An input image.\n2. A short, informal edit request from the user.\n\nYour job is to rewrite the user's request into a clear, precise image-edit instruction for an image editing model.\n- Name what the request points at the way it appears in the image: its colour, material and where it is.\n- Change only what the request names. When something is removed, remove only that, and name the things right next to it that stay, such as a handle, a switch or a magnet.\n- Say what the result looks like where the change happens, including what shows where something was removed.\n- For a style change, apply it to the whole image and name the look of the style.\n- Keep the original's colours, light, exposure and time of day unless the request changes them, and say so in the instruction: a black-and-white photo stays black and white, and a dark or night photo stays just as dark.\n- Keep the user's intent, add nothing they did not ask for, such as new lighting, colours or weather, and keep everything else as it is.\n\nOutput only the instruction, as one paragraph."
+  },
+  "class_type": "AUSBOSS_NODES_Text",
+  "_meta": {
+   "title": "Text - Writer instructions"
+  }
+ },
+ "75:71": {
+  "inputs": {
+   "f_string": "{a}\n\nEdit request: {b}",
+   "values.a": [
+    "75:70",
+    0
+   ],
+   "values.b": [
+    "58",
+    0
+   ]
+  },
+  "class_type": "StringFormat",
+  "_meta": {
+   "title": "Instructions plus your edit"
+  }
+ },
+ "75:72": {
+  "inputs": {
+   "max_length": 512,
+   "sampling_mode": "on",
+   "thinking": true,
+   "use_default_template": true,
+   "mtp": "auto",
+   "clip": [
+    "53",
+    0
+   ],
+   "prompt": [
+    "75:71",
+    0
+   ],
+   "image": [
+    "75:57",
+    0
+   ],
+   "sampling_mode.temperature": 0.5,
+   "sampling_mode.top_k": 20,
+   "sampling_mode.top_p": 0.9,
+   "sampling_mode.min_p": 0,
+   "sampling_mode.repetition_penalty": 1,
+   "sampling_mode.seed": 1,
+   "sampling_mode.presence_penalty": 0
+  },
+  "class_type": "TextGenerate",
+  "_meta": {
+   "title": "Generate Text - Qwen3-VL writes the instruction"
+  }
+ },
+ "75:73": {
+  "inputs": {
+   "text": [
+    "75:72",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_ShowText",
+  "_meta": {
+   "title": "Show Text - Instruction Qwen gets"
+  }
+ },
+ "75:86": {
+  "inputs": {
+   "width": 64,
+   "height": 64,
+   "batch_size": 1,
+   "color": 8421504
+  },
+  "class_type": "EmptyImage",
+  "_meta": {
+   "title": "Fill colour for see-through parts"
+  }
+ },
+ "75:87": {
+  "inputs": {
+   "x": 0,
+   "y": 0,
+   "resize_source": true,
+   "destination": [
+    "56",
+    0
+   ],
+   "source": [
+    "75:86",
+    0
+   ],
+   "mask": [
+    "56",
+    1
+   ]
+  },
+  "class_type": "ImageCompositeMasked",
+  "_meta": {
+   "title": "Fill see-through parts"
+  }
+ },
+ "76:69": {
+  "inputs": {
+   "image": "",
+   "pad_left": 64,
+   "pad_top": 64,
+   "pad_right": 64,
+   "pad_bottom": 64,
+   "mode": "mirror",
+   "fill_color": "#808080",
+   "backdrop_blur": 0.5,
+   "feather": 0,
+   "canvas_multiple": 32,
+   "target_megapixels": 0,
+   "source_image": [
+    "75:57",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_LoadImagePad",
+  "_meta": {
+   "title": "Load Image + Pad - Mirror margin"
+  }
+ },
+ "76:59": {
+  "inputs": {
+   "negative_prompt": "",
+   "resolution": 0,
+   "clip": [
+    "53",
+    0
+   ],
+   "prompt": [
+    "75:73",
+    0
+   ],
+   "vae": [
+    "54",
+    0
+   ],
+   "images.image_1": [
+    "76:69",
+    0
+   ]
+  },
+  "class_type": "TextEncodeQwenImage21",
+  "_meta": {
+   "title": "Text Encode Qwen Image 2.1 - Instruction and picture"
+  }
+ },
+ "76:55": {
+  "inputs": {
+   "device": "auto",
+   "dtype": "default",
+   "model": [
+    "74",
+    0
+   ]
+  },
+  "class_type": "QwenImage21Cache",
+  "_meta": {
+   "title": "Reference cache"
+  }
+ },
+ "76:61": {
+  "inputs": {
+   "steps": 25,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1,
+   "model": [
+    "76:55",
+    0
+   ],
+   "seed": [
+    "60",
+    0
+   ],
+   "positive": [
+    "76:59",
+    0
+   ],
+   "negative": [
+    "76:59",
+    1
+   ],
+   "latent_image": [
+    "76:59",
+    2
+   ]
+  },
+  "class_type": "KSampler",
+  "_meta": {
+   "title": "Qwen 2.1 sampler"
+  }
+ },
+ "76:62": {
+  "inputs": {
+   "samples": [
+    "76:61",
+    0
+   ],
+   "vae": [
+    "54",
+    0
+   ]
+  },
+  "class_type": "VAEDecode",
+  "_meta": {
+   "title": "Decode"
+  }
+ },
+ "76:66": {
+  "inputs": {
+   "fit": "zoom + shift",
+   "empty_fill": "edge",
+   "max_zoom": 20,
+   "edited": [
+    "76:62",
+    0
+   ],
+   "source": [
+    "75:57",
+    0
+   ],
+   "stitcher": [
+    "76:69",
+    4
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_RealignToSource",
+  "_meta": {
+   "title": "Realign to Source"
+  }
+ },
+ "76:68": {
+  "inputs": {
+   "image_a": [
+    "76:62",
+    0
+   ],
+   "image_b": [
+    "76:69",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_Compare",
+  "_meta": {
+   "title": "Image Compare A/B - Raw edit and padded picture"
+  }
+ },
+ "67": {
+  "inputs": {
+   "text": [
+    "76:66",
+    2
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_ShowText",
+  "_meta": {
+   "title": "Show Text - Realign report"
+  }
+ },
+ "64": {
+  "inputs": {
+   "image_a": [
+    "76:66",
+    0
+   ],
+   "image_b": [
+    "75:57",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_Compare",
+  "_meta": {
+   "title": "Image Compare A/B - Before and after"
+  }
+ },
+ "65": {
+  "inputs": {
+   "filename_prefix": "qwen21_edit_realign",
+   "format": "png",
+   "save_metadata": true,
+   "exact_name": "",
+   "on_existing": "overwrite",
+   "output_dir": "",
+   "caption": "",
+   "name_counter": true,
+   "name_date": false,
+   "name_time": false,
+   "name_size": false,
+   "name_batch": false,
+   "preview": true,
+   "step_preview": false,
+   "autosave": true,
+   "images": [
+    "64",
+    0
+   ]
+  },
+  "class_type": "AUSBOSS_NODES_SaveImage",
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "63": {
+  "inputs": {},
+  "class_type": "AUSBOSS_NODES_RunTimer",
+  "_meta": {
+   "title": "Run Timer"
+  }
+ },
+ "51": {
+  "inputs": {
+   "note": "{\"v\": 1, \"title\": \"Qwen Image 2.1 Edit + Realign\", \"subtitle\": \"Change a picture in plain words, and the edit lines up with the original.\", \"author\": \"AusBoss\", \"layout\": \"card\", \"accent\": \"\", \"body\": \"[\u25b6 AusBoss on YouTube](https://www.youtube.com/@ausbossdev) \u00b7 videos on these nodes and workflows\\n\\n---\\n\\n1. Load your image.\\n2. Say the change in plain words.\\n3. Run.\\n\\nWhen you move an arm or a hand, say where it ends up. Otherwise Qwen can keep the old pose and add a new hand.\\n\\nNeeds AusBoss nodes 2.3.0 or newer.\", \"models\": [{\"name\": \"qwen_image_2.1_int8_convrot.safetensors\", \"dir\": \"diffusion_models\", \"size\": \"7.26 GB\", \"url\": \"https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors\", \"note\": \"\"}, {\"name\": \"qwen3vl_8b_int8_convrot.safetensors\", \"dir\": \"text_encoders\", \"size\": \"9.35 GB\", \"url\": \"https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors\", \"note\": \"\"}, {\"name\": \"qwen_image_2.1_vae_bf16.safetensors\", \"dir\": \"vae\", \"size\": \"676 MB\", \"url\": \"https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors\", \"note\": \"\"}, {\"name\": \"qwen-image-2.1-consistency.safetensors\", \"dir\": \"loras\", \"size\": \"159 MB\", \"url\": \"https://huggingface.co/ausboss/Qwen-Image-2.1-Consistency-LoRA/resolve/main/qwen-image-2.1-consistency.safetensors\", \"note\": \"optional, its row is off\"}], \"packs\": [{\"name\": \"ComfyUI-AusBoss\", \"url\": \"https://github.com/ausboss/ComfyUI-AusBoss\", \"node\": \"AUSBOSS_NODES_RealignToSource\"}], \"links\": [{\"label\": \"YouTube \u00b7 ausbossdev\", \"url\": \"https://www.youtube.com/@ausbossdev\"}, {\"label\": \"GitHub \u00b7 ausboss\", \"url\": \"https://github.com/ausboss\"}, {\"label\": \"Civitai \u00b7 AusBoss\", \"url\": \"https://civitai.com/user/AusBoss\"}, {\"label\": \"X \u00b7 Zanzibased\", \"url\": \"https://x.com/Zanzibased\"}]}"
+  },
+  "class_type": "AUSBOSS_NODES_WorkflowNote",
+  "_meta": {
+   "title": "\ud83c\udd8e AusBoss"
+  }
+ }
+}

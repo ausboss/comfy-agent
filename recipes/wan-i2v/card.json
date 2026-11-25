@@ -1,0 +1,85 @@
+{
+ "title": "Wan 2.2 14B: animate a picture",
+ "does": "Turns one picture into a short video clip, 5 seconds at 16 fps by default. With fast on (the default) a 640x640 clip takes about a minute on an RTX 5090. Needs about 24 GB of VRAM, less with ComfyUI's offloading.",
+ "inputs": {
+  "image": {
+   "set": "97.image",
+   "type": "image",
+   "required": true,
+   "help": "the picture to bring to life"
+  },
+  "prompt": {
+   "set": "129:93.text",
+   "required": true,
+   "help": "what moves and how the camera moves"
+  },
+  "seed": {
+   "set": [
+    "129:86.noise_seed",
+    "129:85.noise_seed"
+   ],
+   "default": "random",
+   "help": "same seed and settings give the same result"
+  },
+  "seconds": {
+   "set": "129:161.value",
+   "default": 5,
+   "help": "length of the clip"
+  },
+  "width": {
+   "set": "129:98.width",
+   "default": 640,
+   "help": "pixels; keep the picture's shape"
+  },
+  "height": {
+   "set": "129:98.height",
+   "default": 640,
+   "help": "pixels; keep the picture's shape"
+  },
+  "fast": {
+   "set": "129:131.value",
+   "default": true,
+   "type": "bool",
+   "help": "4-step LoRA: about 5 times faster, a little less detail"
+  }
+ },
+ "tips": [
+  "Describe the motion, not the picture: who moves, how, and what the camera does (slow push in, orbit, handheld).",
+  "Match width and height to the picture's shape, e.g. 832x480 for a wide picture."
+ ],
+ "needs": {
+  "nodes": [],
+  "models": [
+   {
+    "file": "wan_2.1_vae.safetensors",
+    "folder": "vae",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"
+   },
+   {
+    "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+    "folder": "text_encoders",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+   },
+   {
+    "file": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+    "folder": "diffusion_models",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+   },
+   {
+    "file": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+    "folder": "diffusion_models",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+   },
+   {
+    "file": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+    "folder": "loras",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+   },
+   {
+    "file": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+    "folder": "loras",
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+   }
+  ]
+ }
+}

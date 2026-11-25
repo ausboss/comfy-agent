@@ -1,0 +1,5 @@
+outputs/
+comfy-agent.local.json
+__pycache__/
+*.part
+.private/
