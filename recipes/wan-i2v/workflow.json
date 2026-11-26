@@ -309,7 +309,7 @@
         "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
         "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
         "wan_2.1_vae.safetensors",
-        false
+        true
       ]
     }
   ],
@@ -1089,7 +1089,7 @@
               }
             },
             "widgets_values": [
-              false
+              true
             ]
           },
           {

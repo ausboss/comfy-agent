@@ -1,5 +1,8 @@
 """Tests for comfy_agent.py against a fake ComfyUI server. Run: python3 -m unittest discover -s tests"""
+import argparse
 import base64
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -9,6 +12,7 @@ import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import comfy_agent as ca  # noqa: E402
@@ -113,11 +117,14 @@ class ComfyAgentTest(unittest.TestCase):
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-        ca.S["url"] = f"http://127.0.0.1:{cls.server.server_port}"
+        config = mock.patch.dict(ca.S, {"url": f"http://127.0.0.1:{cls.server.server_port}"}, clear=True)
+        config.start()
+        cls.addClassCleanup(config.stop)
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -166,7 +173,9 @@ class ComfyAgentTest(unittest.TestCase):
         self.assertEqual(len(files), 3)
         self.assertTrue(all(Path(f).read_bytes() == PNG for f in files))
         self.assertEqual(ca.load_state()["pending"], [])
-        self.assertTrue((Path(ca.S["out"]) / "index.html").exists())
+        self.assertEqual({j["run"] for j in jobs}, {jobs[0]["run"]})
+        self.assertEqual({m["run"] for m in ca.load_state()["made"].values()}, {jobs[0]["run"]})
+        self.assertFalse((Path(ca.S["out"]) / "index.html").exists())
 
     def test_random_seeds_differ(self):
         jobs = ca.queue_jobs(self.recipe(), [("prompt", "x")], 4)
@@ -188,7 +197,7 @@ class ComfyAgentTest(unittest.TestCase):
             ca.queue_jobs(self.recipe(), [("prompt", "x")], 1)
         self.assertIn("NotInstalled", str(e.exception))
         self.assertIn("nope.safetensors", str(e.exception))
-        self.assertIn("python3 comfy_agent.py install test", str(e.exception))
+        self.assertIn(f"{ca.cli_command()} install test", str(e.exception))
         self.assertEqual(Fake.prompts, {})
 
     def test_refused_job_is_explained_briefly(self):
@@ -266,31 +275,101 @@ class ComfyAgentTest(unittest.TestCase):
         ca.install_pack({"repo": str(root / "pack.git")}, custom_nodes)
         self.assertTrue((custom_nodes / "pack").is_dir())
 
-    def test_gallery_serves_ranges_and_hides_dotfiles(self):
-        out = Path(ca.S["out"])
-        (out / "wan").mkdir(parents=True)
-        (out / "wan" / "clip.mp4").write_bytes(bytes(range(200)))
-        (out / ".comfy-agent-jobs.json").write_text("{}")
-        server = ca.gallery_server(0, "/comfy-agent")
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{server.server_port}/comfy-agent/"
-        try:
-            with ca.open_url(base + "wan/clip.mp4", headers={"Range": "bytes=10-19"}) as r:
-                self.assertEqual(r.status, 206)
-                self.assertEqual(r.headers["Content-Range"], "bytes 10-19/200")
-                self.assertEqual(r.read(), bytes(range(10, 20)))
-            with ca.open_url(base + "wan/clip.mp4") as r:
-                self.assertEqual(len(r.read()), 200)
-            with self.assertRaises(ca.urllib.error.HTTPError) as e:
-                ca.open_url(base + ".comfy-agent-jobs.json")
-            e.exception.close()
-        finally:
-            server.shutdown()
-            server.server_close()
-
     def test_send_needs_a_known_target(self):
         with self.assertRaisesRegex(ca.Fail, "config phone="):
             ca.send_files(["x.png"], "phone")
+
+    def make_one(self, *pairs, sets=()):
+        jobs = ca.queue_jobs(self.recipe(), list(pairs), 1, sets)
+        self.assertEqual(ca.wait_jobs(jobs, timeout=10), [])
+        return ca.load_state()["last"][0]
+
+    def test_redo_remakes_a_result_with_its_settings_and_note(self):
+        photo = Path(self.tmp.name) / "my photo.png"
+        photo.write_bytes(PNG)
+        first = self.make_one(("prompt", "a fox"), ("width", "768"), ("image", str(photo)), sets=[("7.steps", "20")])
+        rel = ca.rel_out(first)
+        run = ca.load_state()["made"][rel]["run"]
+        marks = {"files": {rel: {"mark": "bad", "note": "make it night", "redo": True}},
+                 "runs": {run: {"done_at": "2026-11-25T10:00:00", "files": [rel]}}}
+        (ca.out_dir() / ".comfy-agent-marks.json").write_text(json.dumps(marks))
+        Fake.uploads.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            jobs = ca.queue_redo(first, [("prompt", "a fox at night")])
+        sent = Fake.prompts[jobs[0]["id"]]
+        self.assertEqual(sent["4"]["inputs"]["text"], "a fox at night")
+        self.assertEqual(sent["6"]["inputs"]["width"], 768)
+        self.assertEqual(sent["7"]["inputs"]["steps"], 20)
+        self.assertTrue(sent["8"]["inputs"]["image"].endswith("-my_photo.png"))
+        self.assertEqual(len(Fake.uploads), 1)
+        ca.wait_jobs(jobs, timeout=10)
+        made = ca.load_state()["made"][ca.rel_out(ca.load_state()["last"][0])]
+        self.assertEqual((made["redo_of"], made["note"]), (rel, "make it night"))
+        self.assertEqual(made["given"]["prompt"], "a fox at night")
+        self.assertNotEqual(made["run"], ca.load_state()["made"][rel]["run"])
+
+    def test_redo_needs_a_record(self):
+        out = Path(ca.S["out"]) / "zimage"
+        out.mkdir(parents=True)
+        (out / "old.png").write_bytes(PNG)
+        with self.assertRaisesRegex(ca.Fail, "no record"):
+            ca.queue_redo(str(out / "old.png"), [])
+
+    def test_redo_sends_the_new_result_back(self):
+        ca.S["send"]["phone"] = "tailscale:test-device"
+        first = self.make_one(("prompt", "a fox"))
+        sent, real = [], ca.send_files
+        ca.send_files = lambda files, target: sent.append((files, target)) or "sent"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ca.cmd_redo(argparse.Namespace(file=first, values=[], count=1, no_wait=False, send="phone",
+                                               free=False, timeout=10))
+        finally:
+            ca.send_files = real
+        new = ca.load_state()["last"][0]
+        self.assertNotEqual(new, first)
+        self.assertEqual(sent, [([new], "phone")])
+
+    def test_mcp_results_collects_jobs_and_generate_can_redo(self):
+        ca.S["recipes"] = [str(self.recipe_dir.parent)]
+        try:
+            first = self.make_one(("prompt", "a fox"))
+            rel = ca.rel_out(first)
+            run = ca.load_state()["made"][rel]["run"]
+            note = 'more "snow"\nplease'
+            marks = {"files": {rel: {"mark": "good", "note": note, "redo": "false"}},
+                     "runs": {run: {"done_at": "2026-11-25T10:00:00", "files": [rel]}}}
+            (ca.out_dir() / ".comfy-agent-marks.json").write_text(json.dumps(marks))
+            call = lambda name, args: ca.mcp_handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                                    "params": {"name": name, "arguments": args}})["result"]
+            pending = ca.queue_jobs(self.recipe(), [("prompt", "a second fox")])
+            text = call("results", {})["content"][0]["text"]
+            self.assertIn(pending[0]["run"], text)
+            self.assertNotIn(run, text)
+            self.assertEqual(call("results", {})["content"][0]["text"], "No jobs are waiting.")
+            res = call("generate", {"redo": rel, "count": 2})
+            self.assertNotIn("isError", res)
+            self.assertIn(f'queued 2 redo(s) of {rel} with test (its note: {json.dumps(note)})', res["content"][0]["text"])
+            self.assertEqual([c["type"] for c in res["content"]], ["text", "image", "image"])
+            made = ca.load_state()["made"][ca.rel_out(ca.load_state()["last"][0])]
+            self.assertIs(made["receipt"]["review"]["requested_redo"], False)
+            self.assertTrue(call("generate", {})["isError"])
+        finally:
+            ca.S.pop("recipes")
+
+    def test_manual_redo_does_not_use_an_unsubmitted_note(self):
+        first = self.make_one(("prompt", "a fox"))
+        rel = ca.rel_out(first)
+        marks = {"files": {rel: {"note": "not submitted", "redo": True}}}
+        (ca.out_dir() / ".comfy-agent-marks.json").write_text(json.dumps(marks))
+        jobs = ca.queue_redo(first, [])
+        self.assertNotIn("note", jobs[0])
+        self.assertTrue(ca.load_marks()["files"][rel]["redo"])
+
+    def test_legacy_runs_use_recipe_and_full_timestamp(self):
+        self.assertEqual(ca.result_run("my recipe/20261124-232150-02-1.png", {}), "my recipe/20261124-232150")
+        self.assertEqual(ca.result_run("wan/20261124-232150-01.mp4", {}), "wan/20261124-232150")
+        self.assertEqual(ca.result_run("misc/my + # file.png", {}), "file:misc/my + # file.png")
 
 
 if __name__ == "__main__":

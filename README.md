@@ -5,12 +5,17 @@ Let any AI agent make pictures and videos with your ComfyUI, from plain English.
 > "Make me four pictures of a cabin in the snow, turn the best one into a video, and send them to my phone."
 
 Claude Code, Codex, pi, OpenClaw, Cursor, or a small local model: they all can run a command, so they all can
-use this. It's one Python file with no dependencies, a short instruction file for the agent, and **recipes**:
+use this. It's a Python CLI with no required packages, a short instruction file for the agent, and **recipes**:
 your workflows, each converted once into a form an agent can use without reading the whole graph.
 
 **AI agents: read [SKILL.md](SKILL.md) and follow it.**
 
+The easiest setup: open your agent anywhere and say *"Set up github.com/ausboss/comfy-agent for me."*
+It reads [SETUP.md](SETUP.md), checks your ComfyUI and asks you a few questions.
+
 ## Quick start
+
+On Windows, use `python` in place of `python3` in these commands.
 
 1. Start ComfyUI the way you normally do.
 2. Get this folder and check that it can see ComfyUI:
@@ -35,7 +40,8 @@ ln -s "$PWD" ~/.openclaw/workspace/skills/comfy-agent   # OpenClaw
 ```
 
 The first time a recipe needs something you don't have, the agent shows you the list (node packs and model
-files with their sizes) and asks once. After your yes it installs everything and carries on.
+files with their sizes) and asks once. After your yes it installs everything and carries on. Run the install
+on the computer that runs ComfyUI, with the kit pointed at its local address.
 
 ## What the agent runs
 
@@ -45,9 +51,9 @@ comfy_agent.py show RECIPE                   its settings, defaults and tips
 comfy_agent.py run RECIPE prompt="..." --count 4 [--send] [--no-wait]
 comfy_agent.py wait                          collect jobs that are still running
 comfy_agent.py send last                     send the last results to your phone
+comfy_agent.py redo FILE prompt="..."        make a result again, changed the way your note asks
 comfy_agent.py doctor | install RECIPE [--yes] | restart
 comfy_agent.py add WORKFLOW.json --name NAME make a recipe from your own workflow
-comfy_agent.py gallery                       a private web page of every result, on your tailnet
 comfy_agent.py mcp [--http PORT --token T]   the same thing as a 3-tool MCP server
 ```
 
@@ -55,6 +61,10 @@ comfy_agent.py mcp [--http PORT --token T]   the same thing as a 3-tool MCP serv
 It finds model files wherever your ComfyUI keeps them (same file name, any subfolder), uploads the
 pictures or clips you give it, waits, downloads every result to `outputs/RECIPE/`, and prints each path
 with its seed.
+
+If a job fails, saves no files, or runs only part of the workflow, the CLI exits with an error and the MCP
+`generate` tool reports one too. You can still use the files that were saved. If the agent stops after
+sending a job, run `wait` to collect it.
 
 ## The recipes in this repo
 
@@ -69,16 +79,13 @@ Times are from an RTX 5090. Each recipe lists its models and where to download t
 
 ## Get results on your phone or another computer
 
-- **Taildrop** (Tailscale): `python3 comfy_agent.py config phone=tailscale:YOUR-PHONE laptop=tailscale:YOUR-LAPTOP`,
-  then add `--send` (or `--send laptop`) to any run. On an iPhone, open the Tailscale app to save the files.
-- **Gallery**: `python3 comfy_agent.py gallery` serves `outputs/` on your tailnet with
-  Tailscale Serve and prints the address. Open it in any browser on your phone or computers; only your own
-  devices can reach it.
-- **ntfy**: `python3 comfy_agent.py config phone=ntfy:SOME-LONG-RANDOM-TOPIC` sends each file as a push
-  notification. On ntfy.sh, anyone who knows the topic can see the pictures, so use a long random
-  name or your own ntfy server.
+Use `--send` on a run or `python3 comfy_agent.py send last` to send the original files with Taildrop or ntfy.
+[Phone setup and file delivery](docs/phone.md)
 
-More in [docs/phone.md](docs/phone.md).
+To review results on your phone, mark Good picks, or request redos, use the optional review page from
+[comfy-agent-review](https://github.com/ausboss/comfy-agent-review).
+Coming from a kit that had the page built in? Run `python3 comfy_agent.py gallery --off` before you update, or
+`python3 review.py gallery --off` from the add-on afterwards. Your marks and results stay where they are.
 
 ## A local model on a 16 GB card
 
@@ -122,11 +129,44 @@ The agent pays for every token it reads, on every turn. Measured on the workflow
 | One AusBoss workflow file (Klein 9B Outpaint) | 16,909 |
 | The same workflow in API format | 3,782 |
 | Its recipe card, through `show` | about 150 |
-| `SKILL.md` | about 850 |
+| `SKILL.md` | about 920 |
 
 The same job ("make 3 pictures") with a local Qwen 27B in pi: 11,067 input tokens through this kit's MCP
 server, 28,266 through the CLI, 389,375 through artokun's compact mode and 1,016,227 through Comfy's official
 server. Details: [docs/tokens.md](docs/tokens.md). What we found along the way: [docs/research.md](docs/research.md).
+
+## Usage stats (optional)
+
+Off unless you turn it on. When it's on, the kit keeps a small log of how much it hands your agent to read,
+so you can see what it adds to your agent's tokens. The log stays in your outputs folder; the kit never sends
+it anywhere.
+
+```bash
+python3 comfy_agent.py config stats=on     # start keeping the log
+python3 comfy_agent.py stats               # your totals
+python3 comfy_agent.py stats --share       # a short summary you can post yourself
+python3 comfy_agent.py config stats=off    # stop
+```
+
+- **What it keeps:** one line per command or MCP tool call, in `stats.jsonl` in your outputs folder
+  (`outputs/` in the kit folder, unless you set `out`). Each line has the time, the kit version, the
+  command, CLI or MCP, the recipe (only if it's one that comes with the kit; any other recipe is just
+  "own"), the size of the reply in characters and in tokens (an estimate: characters ÷ 4), how many
+  pictures came with an MCP reply and their size, how long it took, and whether it worked. A failure gets
+  one of: model missing, node missing, ComfyUI not answering, bad setting, other.
+- **What the log never holds:** your prompts or settings, file names or paths, web addresses, your workflow
+  or recipe names, your name, or the text of an error.
+- **The agent's name** comes only from what the agent says about itself (`--by`, or the name an MCP app
+  sends when it connects). Only well-known agent names are kept; anything else becomes "other".
+- **It counts only the kit's own replies.** Your agent reads much more than that (its instructions, your
+  chat, its own thinking), and the kit can't see any of it. What other programs print while `install`
+  runs them (git, pip) isn't counted either.
+- **Sharing:** `stats --share` writes `stats-share.txt` next to the log and prints all of it, so you can see
+  exactly what's in it. The kit never uploads it. If you'd like to help improve the kit, post it yourself
+  in a GitHub issue or on Discord.
+- **Deleting:** delete `stats.jsonl` and `stats-share.txt` (also in your old outputs folder, if you changed
+  `out`). Turning stats off stops new lines at once, even for an MCP server that's already running, and
+  leaves the file until you delete it.
 
 ## Tests
 

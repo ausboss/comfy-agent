@@ -52,7 +52,7 @@ All five made the pictures. One run each, so read it as a demonstration, not a b
 4. Return file paths and seeds, not JSON, logs or base64. Send a small preview only to clients that can't open
    files.
 5. Batch in one call: `--count 4`, or a setting given more than once for different versions.
-6. Keep the skill short and load it on demand. Ours is about 850 tokens, and pi, Claude Code and Codex read only a
+6. Keep the skill short and load it on demand. Ours is about 920 tokens, and pi, Claude Code and Codex read only a
    skill's one-line description until they need the rest.
 7. Let the agent look at results, but not with a small model as the only judge. Each picture it opens costs
    tokens, and Qwen 27B twice reported a "two-headed fox" in a picture with one fox.
@@ -93,7 +93,7 @@ expect to unload one before running the other.
 ## Getting results to you
 
 - **Phone:** Taildrop sends files straight to your phone over Tailscale (on an iPhone they wait in the Tailscale
-  app); the gallery serves `outputs/` to your tailnet with Tailscale Serve; ntfy sends push notifications. See
+  app). The ntfy option sends push notifications. See
   [phone.md](phone.md).
 - **Claude and ChatGPT apps:** they call MCP servers from their own cloud, so your server needs a public HTTPS
   address. Being on your tailnet isn't enough. The kit runs behind Tailscale Funnel with a long secret, and never

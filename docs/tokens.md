@@ -54,10 +54,13 @@ Counted with tiktoken `o200k_base` (a stand-in; Qwen's tokenizer gives similar b
 | Klein 9B Outpaint (AusBoss), the saved workflow file | 16,909 |
 | The same workflow in API format | 3,782 |
 | comfy-cli's `workflow slots` for it (80 slots, with every model list) | about 15,000 |
-| This kit's `SKILL.md` | about 850 |
+| This kit's `SKILL.md` | 920 |
 | `list` with four recipes | about 120 |
 | `show` for one recipe | about 150 |
-| This kit's three MCP tool definitions | about 300 |
+| This kit's three MCP tool definitions | 394 |
+
+To measure the kit's replies on your own computer, turn on the optional usage log: README, "Usage stats
+(optional)".
 
 ## Why
 

@@ -76,6 +76,11 @@
     "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors"
    },
    {
+    "file": "pixaoutpaint.safetensors",
+    "folder": "loras",
+    "url": "https://huggingface.co/Pixaroma/experimental_loras/resolve/main/pixaoutpaint.safetensors"
+   },
+   {
     "file": "qwen3vl_8b_int8_convrot.safetensors",
     "folder": "text_encoders",
     "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors"

@@ -50,6 +50,9 @@ card, as `show` prints it, is about 150.
 python3 comfy_agent.py add "My Workflow.json" --name my-thing
 ```
 
+Each workflow or API export can be up to 16 MiB. To refresh a recipe from its own `workflow.json`,
+use the same `--name` and add `--force`. This replaces the recipe card.
+
 `add` needs ComfyUI running, with the workflow's nodes installed, because it asks ComfyUI what each input is.
 
 1. **Convert.** A saved workflow is the editor's format. `add` converts it with

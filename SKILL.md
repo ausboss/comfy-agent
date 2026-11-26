@@ -1,6 +1,6 @@
 ---
 name: comfy-agent
-description: Make pictures and videos with the person's ComfyUI from plain English, using ready recipes (their workflows). Queues many at once, saves the results and can send them to their phone or another computer. Use when they ask for an image, picture, photo edit, video or clip made with ComfyUI or with one of their workflows.
+description: Make pictures and videos with the person's ComfyUI from plain English, using ready recipes (their workflows). Queues many at once, saves the results. Use when they ask for an image, picture, photo edit, video or clip made with ComfyUI or with one of their workflows.
 ---
 
 # Make pictures and videos with ComfyUI
@@ -27,20 +27,18 @@ Don't open the recipe files or call ComfyUI's API yourself: the script does that
 5. Report: what you made, the file paths, and the seed of each. To change one that's close, keep its seed
    (`seed=N`) and change one setting.
 
-## Send it to their phone or another computer
+Reviewing results on a phone is the optional comfy-agent-review add-on. If it is set up, read REVIEW.md in its folder.
 
-Add `--send` to `run` or `wait`, or afterwards: `python3 comfy_agent.py send last`.
-If it says `phone` isn't set up: run `tailscale status`; if exactly one device is a phone (iOS or
-android), save it with `python3 comfy_agent.py config phone=tailscale:DEVICE-NAME`. Otherwise ask which one.
-For another device, give its name: `--send laptop` (after `config laptop=tailscale:DEVICE-NAME`).
-`python3 comfy_agent.py gallery` prints a private web page of every result, for any of their devices.
+On `run` or `redo`, use `--by` to label the requesting agent or connector and `--request` for the
+actual instruction when available. These are optional receipt fields, not prompt overrides or authentication.
+Never pass keys or a secret connector URL in them.
 
 ## When something is missing
 
 `run` and `python3 comfy_agent.py doctor` say when a recipe can't run yet.
 `python3 comfy_agent.py install RECIPE` then prints what it would add: node packs (code from GitHub) and
 model files with their sizes. Installing is the one thing that needs the person's OK: show them that list
-once. With their yes, run `python3 comfy_agent.py install RECIPE --yes` and carry on without asking again.
+once, unless `python3 comfy_agent.py config` shows `"install": "yes"`. With their yes, run `python3 comfy_agent.py install RECIPE --yes` and carry on without asking again.
 New node packs need a restart: `python3 comfy_agent.py restart`.
 If ComfyUI isn't answering, tell them to start it; don't start or stop it yourself.
 
@@ -49,10 +47,12 @@ If ComfyUI isn't answering, tell them to start it; don't start or stop it yourse
 `python3 comfy_agent.py add WORKFLOW.json --name NAME` makes `recipes/NAME/`. Then edit its `card.json`:
 give each setting a plain name and a help line, mark the ones that must be given `"required": true`,
 delete settings nobody should change, and fill in `title`, `does` and `tips` (the author's notes are in
-`notes.md`). Test with `--count 1` and look at the result.
+`notes.md`). Test with `--count 1` and look at the result. For a one-off value that has no setting,
+`run` takes `--set NODE.input=VALUE`; `add` lists those inputs.
 
 ## Rules
 
-- Ask before installing anything and before deleting anything. Nothing else needs a question.
+- Ask before installing anything (unless `config` shows `"install": "yes"`) and before deleting
+  anything. Nothing else needs a question.
 - Don't change ComfyUI's settings, its other workflows, or files outside this folder's `outputs/`.
 - Never say a result is good without looking at it.

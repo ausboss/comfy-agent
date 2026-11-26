@@ -5,10 +5,10 @@
 | Tool | Does |
 |---|---|
 | `recipes` | lists the recipes; with a name, shows one recipe's settings and tips |
-| `generate` | `recipe`, `settings`, `count`, optional `send`: queues, waits, returns the text report plus a small JPEG preview of up to 4 pictures |
-| `results` | collects jobs that were still running when `generate` returned |
+| `generate` | `recipe`, `settings`, `count`, optional `send`: queues, waits, returns the text report plus a small JPEG preview of up to 4 pictures. With `redo` (a result's file) instead of `recipe`, it makes that result again with its settings and a new seed; `settings` change it |
+| `results` | collects pending jobs and returns their results. |
 
-Their definitions are about 300 tokens, against 16,577 for Comfy's official local MCP server and 50,247 for
+Their definitions are about 390 tokens, against 16,577 for Comfy's official local MCP server and 50,247 for
 artokun's comfyui-mcp (41 tools each).
 Install and delete are deliberately not tools: those stay with you and the CLI.
 
@@ -111,7 +111,7 @@ What to expect:
   anywhere public, and make a new one if it leaks. Both apps also support OAuth for connectors; this kit
   doesn't implement it.
 - The server returns a JPEG preview of each picture. Whether the app shows it inline varies by app and
-  version; the reliable route to your phone is still `send` (Taildrop or ntfy) or the gallery. Videos come
+  version; the reliable route to your phone is still `send` (Taildrop or ntfy). Videos come
   back as file paths only.
 - A tool call has to finish within the app's time limit. `generate` waits up to 240 seconds
   (`COMFY_AGENT_MCP_WAIT` changes it), then returns what's done; ask the app to call `results` for the rest.

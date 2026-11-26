@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """comfy-agent: let any AI agent make pictures and videos with ComfyUI.
 
-One file, Python 3.9 or newer, standard library only. It talks to ComfyUI over its HTTP API.
+Python 3.9 or newer, standard library only. It talks to ComfyUI over its HTTP API.
 
   comfy_agent.py list                         the recipes, one line each
   comfy_agent.py show RECIPE [--notes]        a recipe's settings, defaults and tips
@@ -9,33 +9,42 @@ One file, Python 3.9 or newer, standard library only. It talks to ComfyUI over i
         [--count N] [--send [TARGET]] [--no-wait] [--free] [--set NODE.input=VALUE]
   comfy_agent.py wait [--send [TARGET]]       wait for queued jobs and save their results
   comfy_agent.py send [FILE ... | last] [--to TARGET]
+  comfy_agent.py redo FILE [name=value ...]   make a result again: same recipe and settings, a new seed
   comfy_agent.py doctor                       is ComfyUI up, which recipes are ready
   comfy_agent.py install RECIPE [--yes]       install a recipe's node packs and models
   comfy_agent.py restart                      restart ComfyUI (after new node packs)
   comfy_agent.py add WORKFLOW.json --name NAME  turn a ComfyUI workflow into a recipe
-  comfy_agent.py gallery [--off]              the results as a private web page on your tailnet
   comfy_agent.py config [key=value ...]       url, out, and where "phone" is
+  comfy_agent.py stats [--share]              your own usage totals, if you turned stats on
   comfy_agent.py mcp [--http PORT --token T]  the same thing as an MCP server with 3 tools
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import contextlib
 import copy
 import datetime as dt
 import difflib
 import hashlib
-import html
+import http.client
 import io
+import ipaddress
 import json
+import math
 import mimetypes
 import os
+import platform
 import random
 import re
 import shutil
+import stat
+import statistics
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -43,17 +52,25 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+VERSION = "1.0"
 KIT = Path(__file__).resolve().parent
 CONFIG = KIT / "comfy-agent.local.json"
 MODEL_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 VIDEO_EXT = (".mp4", ".webm", ".mov", ".mkv")
-MEDIA_KINDS = ("image", "video", "audio", "file")
-CLIENT_ID = str(uuid.uuid4())
+UPLOAD_EXT = {"image": IMAGE_EXT + (".bmp", ".tif", ".tiff", ".avif"), "video": VIDEO_EXT + (".avi", ".m4v"),
+              "audio": (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")}
+MEDIA_KINDS = (*UPLOAD_EXT, "file")
 
 
 class Fail(Exception):
-    """A problem to explain to the person. Printed without a traceback."""
+    """A problem to explain to the person. Printed without a traceback.
+
+    kind is one of STATS_ERRORS, for the optional usage log; the message itself is never logged."""
+
+    def __init__(self, *args, kind="other"):
+        super().__init__(*args)
+        self.kind = kind
 
 
 class ComfyError(Exception):
@@ -78,11 +95,27 @@ def load_settings():
 S = load_settings()
 
 
+def cli_command():
+    return "python comfy_agent.py" if os.name == "nt" else "python3 comfy_agent.py"
+
+
 def out_dir():
     return Path(S["out"]).expanduser()
 
 
 # ---------------------------------------------------------------- HTTP
+
+class CredentialRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        before, after = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if redirected is not None:
+            redirected.remove_header("Authorization")
+            if (after.scheme == before.scheme == "https" and after.hostname == before.hostname
+                    and after.port in (None, 443) and after.username is None and req.has_header("Authorization")):
+                redirected.add_unredirected_header("Authorization", req.get_header("Authorization"))
+        return redirected
+
 
 def open_url(url, method="GET", body=None, headers=None, timeout=60):
     headers = dict(headers or {})
@@ -91,6 +124,8 @@ def open_url(url, method="GET", body=None, headers=None, timeout=60):
         data = json.dumps(body).encode()
         headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    if req.has_header("Authorization"):
+        return urllib.request.build_opener(CredentialRedirect()).open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -109,7 +144,8 @@ def comfy(path, body=None, method=None, headers=None, timeout=60, raw=False):
         raise ComfyError(e.code, detail) from None
     except (urllib.error.URLError, OSError) as e:
         raise Fail(f"ComfyUI is not answering at {S['url']} ({getattr(e, 'reason', e)}).\n"
-                   "Start ComfyUI first. If it runs on another address: python3 comfy_agent.py config url=http://HOST:PORT") from None
+                   f"Start ComfyUI first. If it runs on another address: {cli_command()} config url=http://HOST:PORT",
+                   kind="ComfyUI not answering") from None
     if raw:
         return payload
     return json.loads(payload) if payload.strip() else None
@@ -128,7 +164,13 @@ def download(url, dest, headers=None, quiet=True):
         with open_url(url, headers=headers, timeout=120) as r:
             mode = "ab" if have and r.status == 206 else "wb"
             total = r.headers.get("Content-Length")
-            total = int(total) + (have if mode == "ab" else 0) if total else None
+            total = int(total) if total else None
+            if r.status == 206:
+                span = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                if (not span or int(span[1]) != have or not have <= int(span[2]) < int(span[3])
+                        or (total is not None and total != int(span[2]) - have + 1)):
+                    raise Fail("The server returned the wrong part of the file. Try the download again.")
+                total = int(span[3])
             done = have if mode == "ab" else 0
             mark = 0
             with open(part, mode) as f:
@@ -141,12 +183,14 @@ def download(url, dest, headers=None, quiet=True):
                     if not quiet and total and done * 4 // total > mark:
                         mark = done * 4 // total
                         print(f"  {dest.name}: {mark * 25}% of {gb(total)}", flush=True)
+            if not done or (total is not None and done != total):
+                raise Fail("The download ended before the whole file arrived. Try again to resume.")
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise Fail(f"{url} needs a login (HTTP {e.code}). Set HF_TOKEN (Hugging Face) or CIVITAI_API_KEY (Civitai) "
                        "and try again. Some models also need their license accepted on the website first.") from None
         raise Fail(f"Download failed, HTTP {e.code}: {url}") from None
-    except (urllib.error.URLError, OSError) as e:
+    except (http.client.HTTPException, OSError) as e:
         raise Fail(f"Download stopped ({e}). Run the same command again to resume.") from None
     part.replace(dest)
     return dest
@@ -157,11 +201,14 @@ def env_first(*names):
 
 
 def auth_headers(url):
-    host = urllib.parse.urlparse(url).netloc
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username is not None or parsed.port not in (None, 443):
+        return {}
+    host = parsed.hostname
     key = None
-    if host.endswith("huggingface.co"):
+    if host == "huggingface.co":
         key = env_first("HF_TOKEN", "HUGGINGFACE_TOKEN", "HF_API_TOKEN")
-    elif host.endswith("civitai.com"):
+    elif host == "civitai.com":
         key = env_first("CIVITAI_API_KEY", "CIVITAI_API_TOKEN", "CIVITAI_TOKEN")
     return {"Authorization": "Bearer " + key} if key else {}
 
@@ -198,16 +245,19 @@ class Recipe:
         return json.loads((self.folder / "prompt.json").read_text(encoding="utf-8"))
 
 
-def get_recipe(name):
-    p = Path(name).expanduser()
-    if (p / "card.json").exists():
-        return Recipe(p)
+def get_recipe(name, *, registered=False):
+    if not isinstance(name, str):
+        raise Fail("Choose a recipe by name.", kind="bad setting")
+    if not registered:
+        p = Path(name).expanduser()
+        if (p / "card.json").exists():
+            return stats_recipe(Recipe(p))
     found = all_recipes()
     if name in found:
-        return Recipe(found[name])
+        return stats_recipe(Recipe(found[name]))
     near = difflib.get_close_matches(name, list(found), n=3, cutoff=0.4)
     hint = f" Did you mean {' or '.join(near)}?" if near else ""
-    raise Fail(f"No recipe called '{name}'.{hint} See them all: python3 comfy_agent.py list")
+    raise Fail(f"No recipe called '{name}'.{hint} See them all: {cli_command()} list", kind="bad setting")
 
 
 def kind_of(key, spec):
@@ -230,26 +280,40 @@ def targets(spec):
 
 def put(prompt, addr, value):
     nid, _, key = addr.partition(".")
+    if not key:
+        raise Fail(f"'{addr}' is not NODE.input. --set takes a node input such as 23.seed=5; "
+                   f"a recipe setting such as {addr} is given as {addr}=VALUE without --set.", kind="bad setting")
     node = prompt.get(nid)
     if node is None:
-        raise Fail(f"The recipe points at node {nid}, which is not in its prompt.json.")
+        raise Fail(f"The recipe points at node {nid}, which is not in its prompt.json.", kind="bad setting")
     if key not in node["inputs"]:
-        raise Fail(f"Node {nid} ({node['class_type']}) has no input '{key}'. It has: {', '.join(node['inputs'])}")
+        raise Fail(f"Node {nid} ({node['class_type']}) has no input '{key}'. It has: {', '.join(node['inputs'])}",
+                   kind="bad setting")
     if isinstance(node["inputs"][key], list):
-        raise Fail(f"{addr} is wired to another node, so it can't be set to a value.")
+        raise Fail(f"{addr} is wired to another node, so it can't be set to a value.", kind="bad setting")
     node["inputs"][key] = value
 
 
-def coerce(value, kind):
-    if kind == "number":
-        for cast in (int, float):
+def coerce(value, kind, key="setting"):
+    if kind in ("number", "seed"):
+        if isinstance(value, str):
             try:
-                return cast(value)
-            except (TypeError, ValueError):
-                pass
-        raise Fail(f"'{value}' is not a number.")
+                value = int(value)
+            except ValueError:
+                if kind == "number":
+                    with contextlib.suppress(ValueError):
+                        value = float(value)
+        if type(value) is int or (kind == "number" and type(value) is float and math.isfinite(value)):
+            return value
+        raise Fail(f"{key} needs a whole number or random." if kind == "seed" else f"{key} needs a number.",
+                   kind="bad setting")
     if kind == "bool":
-        return str(value).lower() in ("1", "true", "yes", "on")
+        word = str(value).lower()
+        if word in ("1", "true", "yes", "on"):
+            return True
+        if word in ("0", "false", "no", "off"):
+            return False
+        raise Fail(f"Use true or false for {key}.", kind="bad setting")
     return value
 
 
@@ -264,7 +328,7 @@ def parse_pairs(items):
     pairs = []
     for item in items:
         if "=" not in item:
-            raise Fail(f"'{item}' should look like name=value.")
+            raise Fail(f"'{item}' should look like name=value.", kind="bad setting")
         k, v = item.split("=", 1)
         pairs.append((k.strip(), v))
     return pairs
@@ -276,15 +340,17 @@ def plan_jobs(recipe, pairs, count):
     given = {}
     for k, v in pairs:
         if k not in recipe.inputs:
-            raise Fail(f"{recipe.name} has no setting '{k}'. Its settings: {', '.join(recipe.inputs)}")
+            raise Fail(f"{recipe.name} has no setting '{k}'. Its settings: {', '.join(recipe.inputs)}", kind="bad setting")
         given.setdefault(k, []).append(v)
     lengths = {len(v) for v in given.values() if len(v) > 1}
     if len(lengths) > 1:
-        raise Fail("Settings given more than once are paired in order, so give each one the same number of times.")
+        raise Fail("Settings given more than once are paired in order, so give each one the same number of times.",
+                   kind="bad setting")
     rounds = lengths.pop() if lengths else 1
     for key, spec in recipe.inputs.items():
-        if spec.get("required") and key not in given:
-            raise Fail(f"{recipe.name} needs {key}=... ({spec.get('help') or kind_of(key, spec)}).")
+        if spec.get("required") and any(v is None or isinstance(v, str) and not v.strip()
+                                        for v in given.get(key, [None])):
+            raise Fail(f"{recipe.name} needs {key}=... ({spec.get('help') or kind_of(key, spec)}).", kind="bad setting")
     return [{k: (v[i] if len(v) > 1 else v[0]) for k, v in given.items()} for i in range(rounds) for _ in range(count)]
 
 
@@ -345,21 +411,40 @@ def preflight(prompt):
     """Point model names at wherever this ComfyUI keeps the same file, in place.
     Returns (missing node types, missing model files)."""
     missing_nodes, missing_models = [], []
+
+    def locate(fields, key, opts):
+        val = fields[key]
+        if opts is None or val in opts:
+            return False
+        for option in opts:
+            if isinstance(option, str) and base_name(option) == base_name(val):
+                fields[key] = option
+                return True
+        missing_models.append(base_name(val))
+        return False
+
     for node in prompt.values():
         if node_info(node["class_type"]) is None:
             missing_nodes.append(node["class_type"])
-            continue
-        for key, val in node["inputs"].items():
-            if not is_model_name(val):
-                continue
-            opts = combo_options(node["class_type"], key)
-            if not opts or val in opts:
-                continue
-            same = [o for o in opts if isinstance(o, str) and base_name(o) == base_name(val)]
-            if same:
-                node["inputs"][key] = same[0]
-            else:
-                missing_models.append(base_name(val))
+        inputs = node["inputs"]
+        for key, val in inputs.items():
+            if is_model_name(val):
+                locate(inputs, key, combo_options(node["class_type"], key))
+        value = inputs.get("loras")
+        if node["class_type"] == "AUSBOSS_NODES_LoraLoader" and isinstance(value, str) and value.strip():
+            try:
+                rows = json.loads(value)
+            except ValueError:
+                rows = None
+            if not isinstance(rows, list):
+                raise Fail("The LoRA loader needs a list of model files.")
+            changed = False
+            for row in rows:
+                if (isinstance(row, dict) and row.get("enabled", True) and not row.get("group_off")
+                        and is_model_name(row.get("name"))):
+                    changed = locate(row, "name", models_in("loras")) or changed
+            if changed:
+                inputs["loras"] = json.dumps(rows, ensure_ascii=False)
     return sorted(set(missing_nodes)), sorted(set(missing_models))
 
 
@@ -370,27 +455,43 @@ def not_ready_message(recipe, nodes, models):
     if models:
         parts.append(f"model files {', '.join(models)}")
     return (f"{recipe.name} can't run yet: this ComfyUI is missing {' and '.join(parts)}.\n"
-            f"See what would be installed: python3 comfy_agent.py install {recipe.name}")
+            f"See what would be installed: {cli_command()} install {recipe.name}")
 
 
 # ---------------------------------------------------------------- run
 
 def upload(path, cache):
     p = Path(path).expanduser()
-    if str(p) in cache:
-        return cache[str(p)]
+    if p in cache:
+        return cache[p]
     if not p.is_file():
-        raise Fail(f"Can't find the file {path}")
-    data = p.read_bytes()
-    name = hashlib.sha1(data).hexdigest()[:8] + "-" + re.sub(r"[^\w.-]+", "_", p.name)
-    boundary = uuid.uuid4().hex
-    ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{name}"\r\n'
-            f"Content-Type: {ctype}\r\n\r\n").encode() + data + (
-        f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n--{boundary}--\r\n').encode()
-    res = comfy("/upload/image", body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, timeout=300)
-    cache[str(p)] = f"{res['subfolder']}/{res['name']}" if res.get("subfolder") else res["name"]
-    return cache[str(p)]
+        raise Fail(f"Can't find the file {p}", kind="bad setting")
+    with p.open("rb") as stream:
+        digest = hashlib.sha1()
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+        size = stream.tell()
+        stream.seek(0)
+        name = digest.hexdigest()[:8] + "-" + re.sub(r"[^\w.-]+", "_", p.name)
+        boundary = uuid.uuid4().hex
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        head = (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{name}"\r\n'
+                f"Content-Type: {ctype}\r\n\r\n").encode()
+        tail = f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n--{boundary}--\r\n'.encode()
+
+        def body():
+            yield head
+            while stream.tell() < size:
+                chunk = stream.read(min(size - stream.tell(), 1 << 20))
+                if not chunk:
+                    raise Fail("The input file changed during the upload.")
+                yield chunk
+            yield tail
+
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(head) + size + len(tail))}
+        res = comfy("/upload/image", body(), headers=headers, timeout=300)
+    cache[p] = f"{res['subfolder']}/{res['name']}" if res.get("subfolder") else res["name"]
+    return cache[p]
 
 
 def explain(detail):
@@ -412,66 +513,166 @@ def run_error(status):
             return f"{data.get('node_type')} (node {data.get('node_id')}): {str(data.get('exception_message', '')).strip()[:400]}"
         if kind == "execution_interrupted":
             return "the job was cancelled in ComfyUI"
-    return "ComfyUI reported an error with no message"
+    if status.get("completed") is False or status.get("status_str") in ("error", "failed", "interrupted", "cancelled"):
+        return "ComfyUI stopped before the job finished."
 
 
 def state_file():
     return out_dir() / ".comfy-agent-jobs.json"
 
 
+@contextlib.contextmanager
+def file_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(value, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def load_state():
     try:
         return json.loads(state_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {"pending": [], "last": []}
+    except (OSError, ValueError) as e:
+        raise Fail(f"Cannot read job records at {state_file()}: {e}") from None
 
 
 def save_state(state):
-    out_dir().mkdir(parents=True, exist_ok=True)
-    state_file().write_text(json.dumps(state, indent=1), encoding="utf-8")
+    write_json(state_file(), state)
 
 
-def queue_jobs(recipe, pairs, count=1, raw_sets=()):
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def queue_jobs(recipe, pairs, count=1, raw_sets=(), extra=None, *, transport="cli", by=None, request=None, review=None):
+    from generation_receipt import graph_receipt
+    if any(value is not None and not isinstance(value, str) for value in (by, request)):
+        raise Fail("by and request must be text when supplied.", kind="bad setting")
+    if by is not None:
+        if (not re.fullmatch(r"[\w .()+'-]{1,80}", by) or not by.strip()
+                or by.strip().lower().startswith(("www.", "bearer ", "basic ", "authorization "))
+                or re.fullmatch(r"\d+(?:\.\d+){3}", by.strip())):
+            raise Fail("Use a short display name for by, not an address, URL or credential.", kind="bad setting")
+        by = by.strip()
     jobs_settings = plan_jobs(recipe, pairs, count)
     base = recipe.prompt()
     nodes, models = preflight(base)
     if nodes or models:
-        raise Fail(not_ready_message(recipe, nodes, models))
+        raise Fail(not_ready_message(recipe, nodes, models), kind="node missing" if nodes else "model missing")
     unload_llm()
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    devices = []
+    with contextlib.suppress(Fail, ComfyError, ValueError):
+        stats = comfy("/system_stats", timeout=3)
+        listed = stats.get("devices") if isinstance(stats, dict) else None
+        if isinstance(listed, list):
+            devices = [d["name"] for d in listed if isinstance(d, dict) and isinstance(d.get("name"), str)
+                       and d["name"] and d.get("type") != "cpu" and d["name"].lower() != "cpu"]
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
     uploads, jobs = {}, []
     for i, given in enumerate(jobs_settings):
         prompt = copy.deepcopy(base)
-        job = {"recipe": recipe.name, "n": i + 1, "of": len(jobs_settings), "stamp": stamp, "settings": {}}
+        job = {"recipe": recipe.name, "dir": str(recipe.folder.resolve()), "n": i + 1, "of": len(jobs_settings),
+               "stamp": stamp, "run": f"{recipe.name}/{stamp}", "settings": {}, "given": {}, **(extra or {})}
+        if raw_sets:
+            job["sets"] = [list(s) for s in raw_sets]
         for key, spec in recipe.inputs.items():
             kind = kind_of(key, spec)
             value = given.get(key, spec.get("default"))
+            if key in given:
+                if kind in MEDIA_KINDS:
+                    if not isinstance(value, str):
+                        raise Fail(f"Give a file path for {key}.", kind="bad setting")
+                    value = Path(value).expanduser().resolve()
+                    allowed = UPLOAD_EXT[kind] if kind != "file" else sum(UPLOAD_EXT.values(), ())
+                    if value.suffix.lower() not in allowed:
+                        raise Fail(f"Choose a media file for {key} (expected {kind}).", kind="bad setting")
+                job["given"][key] = str(value) if kind in MEDIA_KINDS else value
             if kind == "seed":
-                value = random.randint(1, 2 ** 48) if value in (None, "", "random") else int(value) + i
+                value = random.randint(1, 2 ** 48) if value in (None, "", "random") else coerce(value, kind, key) + i
                 job["seed"] = value
-            elif value is None or value == "":
+            elif (value is None or value == "") and not (key in given and kind in ("bool", "number")):
                 continue
             elif kind in MEDIA_KINDS:
                 if key not in given:
                     continue
                 value = upload(value, uploads)
             else:
-                value = coerce(value, kind)
+                value = coerce(value, kind, key)
             for addr in targets(spec):
                 put(prompt, addr, value)
             if key in given or kind == "seed":
                 job["settings"][key] = value if not isinstance(value, str) or len(value) <= 120 else value[:117] + "..."
         for addr, value in raw_sets:
             put(prompt, addr, json_or_text(value))
-        try:
-            job["id"] = comfy("/prompt", {"prompt": prompt, "client_id": CLIENT_ID})["prompt_id"]
-        except ComfyError as e:
-            raise Fail("ComfyUI refused the job:\n" + explain(e.detail)) from None
+        receipt = graph_receipt(recipe.folder, recipe.card, prompt, given)
+        receipt.update(source={"transport": transport, "by": by}, request=request, review=review,
+                       execution={"prompt_id": None, "submitted_at": now_iso(), "queued_at": None, "started_at": None,
+                                  "completed_at": None, "queue_seconds": None, "run_seconds": None, "devices": devices})
+        job["receipt"] = receipt
+        submit_job(job, prompt)
         jobs.append(job)
-    state = load_state()
-    state["pending"] = state.get("pending", []) + jobs
-    save_state(state)
     return jobs
+
+
+def submit_job(job, prompt):
+    # Save a unique client ID before POST. A lost reply can be matched in the queue or history.
+    job.update(id=str(uuid.uuid4()), unconfirmed=True)
+    with file_lock(state_file().with_suffix(".lock")):
+        state = load_state()
+        state.setdefault("pending", []).append(job)
+        save_state(state)
+        try:
+            reply = comfy("/prompt", {"prompt": prompt, "client_id": job["id"]})
+        except ComfyError as e:
+            if 400 <= e.status < 500:
+                state["pending"].pop()
+                save_state(state)
+            raise Fail("ComfyUI refused the job:\n" + explain(e.detail), kind=refusal_kind(e.detail)) from None
+        if not isinstance(reply, dict) or not reply.get("prompt_id"):
+            raise Fail("ComfyUI did not confirm the job. Run wait to check it.")
+        job["receipt"]["execution"]["prompt_id"] = job["id"] = reply["prompt_id"]
+        del job["unconfirmed"]
+        if reply.get("node_errors"):
+            job["error"] = "ComfyUI skipped part of the workflow. " + explain(reply)
+        save_state(state)
+        if job.get("error"):
+            print(job["error"], flush=True)
+
+
+def recover_submissions(jobs):
+    unknown = {j["id"]: j for j in jobs if j.get("unconfirmed")}
+    if not unknown:
+        return
+    q = comfy("/queue")
+
+    def match(rows):
+        for row in rows:
+            if isinstance(row, list) and len(row) > 3 and isinstance(row[3], dict):
+                client = row[3].get("client_id")
+                if client in unknown:
+                    j = unknown.pop(client)
+                    j["receipt"]["execution"]["prompt_id"] = j["id"] = row[1]
+                    j["client_id"] = client
+                    del j["unconfirmed"]
+
+    match(q["queue_running"] + q["queue_pending"])
+    if unknown:
+        match(entry.get("prompt") for entry in comfy("/history").values())
 
 
 def save_outputs(entry, job):
@@ -479,7 +680,7 @@ def save_outputs(entry, job):
     for node_out in (entry.get("outputs") or {}).values():
         for val in node_out.values():
             for it in val if isinstance(val, list) else []:
-                if isinstance(it, dict) and it.get("filename"):
+                if isinstance(it, dict) and it.get("filename") and it.get("type") != "input":
                     key = (it["filename"], it.get("subfolder", ""), it.get("type", "output"))
                     if key not in seen:
                         seen.add(key)
@@ -490,18 +691,44 @@ def save_outputs(entry, job):
     for i, it in enumerate(keep, 1):
         q = urllib.parse.urlencode({"filename": it["filename"], "subfolder": it.get("subfolder", ""),
                                     "type": it.get("type", "output")})
-        extra = f"-{i}" if len(keep) > 1 else ""
-        dest = folder / f"{job['stamp']}-{job['n']:02d}{extra}{Path(it['filename']).suffix.lower()}"
+        name = f"{job['stamp']}-{job['n']:02d}" + (f"-{i}" if len(keep) > 1 else "")
+        suffix, k = Path(it["filename"]).suffix.lower(), 2
+        dest = folder / f"{name}{suffix}"
+        while dest.exists():
+            dest, k = folder / f"{name}-{k}{suffix}", k + 1
         download(S["url"] + "/view?" + q, dest)
         saved.append(str(dest))
     job["remote"] = keep
     return saved
 
 
+def history_times(entry):
+    def moment(value):
+        if type(value) in (float, int):
+            with contextlib.suppress(ValueError, OSError, OverflowError):
+                return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc)
+        return None
+
+    prompt = entry.get("prompt")
+    queued = (moment(prompt[3].get("create_time")) if isinstance(prompt, (tuple, list)) and len(prompt) > 3
+              and isinstance(prompt[3], dict) else None)
+    events = {}
+    for item in (entry.get("status") or {}).get("messages") or []:
+        if (isinstance(item, (tuple, list)) and len(item) == 2 and item[0] in ("execution_start", "execution_success")
+                and isinstance(item[1], dict)):
+            events[item[0]] = moment(item[1].get("timestamp"))
+    started, completed = events.get("execution_start"), events.get("execution_success")
+    return {"queued_at": queued.isoformat() if queued else None, "started_at": started.isoformat() if started else None,
+            "completed_at": completed.isoformat() if completed else None,
+            "queue_seconds": (started - queued).total_seconds() if started and queued and started >= queued else None,
+            "run_seconds": (completed - started).total_seconds() if completed and started and completed >= started else None}
+
+
 def wait_jobs(jobs, timeout=600):
     """Wait for jobs, saving each one's files as it finishes. Returns the jobs still running."""
     start, last_check = time.time(), time.time()
     left = list(jobs)
+    recover_submissions(left)
     while left:
         for job in list(left):
             entry = (comfy(f"/history/{job['id']}") or {}).get(job["id"])
@@ -509,24 +736,29 @@ def wait_jobs(jobs, timeout=600):
                 continue
             left.remove(job)
             status = entry.get("status") or {}
-            if status.get("status_str") == "error":
-                job["error"] = run_error(status)
-                print(f"FAILED {job['n']}/{job['of']}: {job['error']}", flush=True)
-                continue
             job["files"] = save_outputs(entry, job)
-            took = ""
-            times = [m[1].get("timestamp") for m in status.get("messages", []) if m[0] in ("execution_start", "execution_success")]
-            if len(times) == 2 and all(times):
-                took = f", {(times[1] - times[0]) / 1000:.1f} s"
+            error = run_error(status) or job.get("error")
+            if error or not job["files"]:
+                job["error"] = error or "ComfyUI saved no files."
+                print(f"FAILED {job['n']}/{job['of']}: {job['error']}", flush=True)
+                if not job["files"]:
+                    continue
+            times = history_times(entry)
+            if "receipt" in job:
+                job["receipt"]["execution"].update(times)
+            took = f", {times['run_seconds']:.1f} s" if times["run_seconds"] is not None else ""
             seed = f", seed {job['seed']}" if "seed" in job else ""
-            print(f"done {job['n']}/{job['of']}{seed}{took}: {', '.join(job['files']) or '(no files)'}", flush=True)
+            label = "saved" if job.get("error") else "done"
+            print(f"{label} {job['n']}/{job['of']}{seed}{took}, run {job.get('run') or job['recipe'] + '/' + job['stamp']}: "
+                  f"{', '.join(job['files'])}", flush=True)
         if not left:
             break
         if time.time() - start > timeout:
-            print(f"{len(left)} job(s) still running. Collect them later with: python3 comfy_agent.py wait", flush=True)
+            print(f"{len(left)} job(s) still running. Collect them later with: {cli_command()} wait", flush=True)
             break
         if time.time() - last_check > 15:
             last_check = time.time()
+            recover_submissions(left)
             q = comfy("/queue") or {}
             live = {item[1] for item in q.get("queue_running", []) + q.get("queue_pending", [])}
             for job in [j for j in left if j["id"] not in live]:
@@ -535,15 +767,21 @@ def wait_jobs(jobs, timeout=600):
                     job["error"] = "ComfyUI lost this job (was it restarted?)"
                     print(f"FAILED {job['n']}/{job['of']}: {job['error']}", flush=True)
         time.sleep(1)
-    finished_ids = {j["id"] for j in jobs if j not in left}
-    state = load_state()
-    state["pending"] = [j for j in state.get("pending", []) if j["id"] not in finished_ids]
-    files = [f for j in jobs if j not in left for f in j.get("files", [])]
-    if files:
-        state["last"] = files
-    save_state(state)
-    if files:
-        write_index()
+    finished = [j for j in jobs if j not in left]
+    finished_ids = {key for j in finished for key in (j["id"], j.get("client_id"))}
+    files = [f for j in finished for f in j.get("files", [])]
+    with file_lock(state_file().with_suffix(".lock")):
+        state = load_state()
+        recovered = {j["client_id"]: j for j in left if j.get("client_id")}
+        state["pending"] = [recovered.get(j["id"], j) for j in state.get("pending", []) if j["id"] not in finished_ids]
+        if files:
+            state["last"] = files
+            made = state.setdefault("made", {})
+            for j in finished:
+                for f in j.get("files", []):
+                    made[Path(f).relative_to(out_dir()).as_posix()] = {
+                        k: j[k] for k in ("recipe", "dir", "run", "given", "sets", "seed", "redo_of", "note", "receipt") if k in j}
+        save_state(state)
     return left
 
 
@@ -560,29 +798,47 @@ def unload_llm():
     if not cmd:
         return
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
     except subprocess.TimeoutExpired:
-        raise Fail(f"Unloading the language model took over 2 minutes: {cmd}") from None
+        raise Fail("Unloading the language model took over 2 minutes.") from None
+    except (OSError, ValueError):
+        raise Fail("Could not start the command to unload the language model.") from None
     if r.returncode:
-        raise Fail(f"Unloading the language model failed ({cmd}): {(r.stderr or r.stdout).strip()[:300]}")
+        raise Fail(f"Unloading the language model failed (exit {r.returncode}). Check your unload_llm setting.")
     print("Unloaded the language model so ComfyUI has the whole card. It loads back on your next turn.", flush=True)
 
 
 def cmd_run(a):
+    if a.send:
+        send_target(a.send)
     recipe = get_recipe(a.recipe)
-    jobs = queue_jobs(recipe, parse_pairs(a.values), max(1, a.count), parse_pairs(a.set or []))
-    print(f"queued {len(jobs)} job(s) of {recipe.name}", flush=True)
+    jobs = queue_jobs(recipe, parse_pairs(a.values), max(1, a.count), parse_pairs(a.set or []),
+                      by=getattr(a, "by", None), request=getattr(a, "request", None))
+    print(f"queued {len(jobs)} job(s) of {recipe.name}; run {jobs[0]['run']}", flush=True)
+    collect(jobs, a)
+
+
+def cmd_redo(a):
+    if a.send:
+        send_target(a.send)
+    collect(queue_redo(a.file, parse_pairs(a.values), max(1, a.count), variation=getattr(a, "variation", False),
+                       by=getattr(a, "by", None), request=getattr(a, "request", None)), a)
+
+
+def collect(jobs, a):
     if a.no_wait and S.get("unload_llm"):
         print("Waiting anyway: the language model is unloaded, and it must not load back until these are done.")
     elif a.no_wait:
-        print("Collect the results with: python3 comfy_agent.py wait")
+        print(f"Collect the results with: {cli_command()} wait")
+        check_jobs(jobs)
         return
     left = wait_jobs(jobs, a.timeout)
     finish(jobs, left, a)
 
 
 def cmd_wait(a):
-    pending = load_state().get("pending", [])
+    with file_lock(state_file().with_suffix(".lock")):
+        pending = load_state().get("pending", [])
     if not pending:
         print("No jobs are waiting.")
         return
@@ -591,18 +847,32 @@ def cmd_wait(a):
     finish(pending, left, a)
 
 
+def check_jobs(jobs, message="Some jobs failed. See the job messages above."):
+    if any(j.get("error") for j in jobs):
+        raise Fail(message)
+
+
 def finish(jobs, left, a):
     files = [f for j in jobs if j not in left for f in j.get("files", [])]
     if files and a.send:
         print(send_files(files, a.send))
     if (a.free or S.get("unload_llm")) and not left:
         free_vram()
+    check_jobs(jobs)
 
 
-# ---------------------------------------------------------------- send and gallery
+# ---------------------------------------------------------------- send
+
+def send_target(target):
+    dest = S.get("send", {}).get(target, target)
+    if isinstance(dest, str) and dest.startswith(("tailscale:", "ntfy:")) and dest.partition(":")[2].strip():
+        return dest
+    raise Fail(f"Don't know where '{target}' is. Set it once: {cli_command()} config phone=tailscale:DEVICE "
+               "(or phone=ntfy:TOPIC). Your Tailscale devices: tailscale status")
+
 
 def send_files(files, target):
-    dest = S.get("send", {}).get(target, target)
+    dest = send_target(target)
     if dest.startswith("tailscale:"):
         device = dest.split(":", 1)[1]
         exe = shutil.which("tailscale")
@@ -620,11 +890,12 @@ def send_files(files, target):
         url = topic if topic.startswith("http") else "https://ntfy.sh/" + topic
         for f in files:
             with open(f, "rb") as fh:
-                open_url(url, "PUT", fh.read(), {"Filename": Path(f).name, "Title": "ComfyUI: " + Path(f).parent.name},
-                         timeout=300).close()
-        return f"Sent {len(files)} file(s) to ntfy topic {url}."
-    raise Fail(f"Don't know where '{target}' is. Set it once: python3 comfy_agent.py config phone=tailscale:DEVICE "
-               "(or phone=ntfy:TOPIC). Your Tailscale devices: tailscale status")
+                try:
+                    open_url(url, "PUT", fh.read(), {"Filename": Path(f).name, "Title": "ComfyUI: " + Path(f).parent.name},
+                             timeout=300).close()
+                except (OSError, ValueError, http.client.HTTPException):
+                    raise Fail("Could not send the file with ntfy. Check the connection and topic settings.") from None
+        return f"Sent {len(files)} file(s) with ntfy."
 
 
 def cmd_send(a):
@@ -639,114 +910,86 @@ def cmd_send(a):
     print(send_files([str(Path(f).resolve()) for f in files], a.to))
 
 
-def write_index():
-    root = out_dir()
-    media = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXT + VIDEO_EXT]
-    media.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    tiles = []
-    for p in media[:300]:
-        rel = html.escape(urllib.parse.quote(p.relative_to(root).as_posix()))
-        cap = html.escape(p.relative_to(root).as_posix())
-        tag = (f'<video src="{rel}" controls playsinline preload="metadata"></video>' if p.suffix.lower() in VIDEO_EXT
-               else f'<img src="{rel}" loading="lazy" alt="{cap}">')
-        tiles.append(f'<figure><a href="{rel}">{tag}</a><figcaption>{cap}</figcaption></figure>')
-    page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>ComfyUI results</title><style>body{margin:0;background:#111;color:#bbb;font:13px system-ui}"
-            "main{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px;padding:6px}"
-            "figure{margin:0}img,video{width:100%;display:block;border-radius:4px}figcaption{padding:2px;"
-            "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}</style><main>" + "".join(tiles) + "</main>")
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "index.html").write_text(page, encoding="utf-8")
+# ---------------------------------------------------------------- redo
+
+def result_run(rel, made):
+    if made.get("run"):
+        return made["run"]
+    p = Path(rel)
+    stamp = re.fullmatch(r"(\d{8}-\d{6}(?:-[0-9a-f]{12})?)-\d+(?:-\d+)*", p.stem)
+    return (p.parent / stamp[1]).as_posix() if stamp else "file:" + rel
 
 
-def gallery_server(port, prefix):
-    """outputs/ over HTTP on 127.0.0.1, with byte ranges so phones can play the videos."""
-    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-
-    class Handler(SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kw):
-            super().__init__(*args, directory=str(out_dir()), **kw)
-
-        def translate_path(self, path):
-            if path == prefix or path.startswith(prefix + "/"):
-                path = path[len(prefix):] or "/"
-            return super().translate_path(path)
-
-        def send_head(self):
-            self.left = None
-            if any(part.startswith(".") for part in urllib.parse.urlparse(self.path).path.split("/")):
-                self.send_error(404)
-                return None
-            path = self.translate_path(self.path)
-            m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
-            if not m or not (m[1] or m[2]) or not os.path.isfile(path):
-                return super().send_head()
-            size = os.path.getsize(path)
-            start = int(m[1]) if m[1] else max(0, size - int(m[2]))
-            end = min(int(m[2]), size - 1) if m[1] and m[2] else size - 1
-            if start >= size or start > end:
-                self.send_error(416)
-                return None
-            f = open(path, "rb")
-            f.seek(start)
-            self.send_response(206)
-            self.send_header("Content-Type", self.guess_type(path))
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.send_header("Content-Length", str(end - start + 1))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-            self.left = end - start + 1
-            return f
-
-        def copyfile(self, source, outputfile):
-            if self.left is None:
-                return super().copyfile(source, outputfile)
-            while self.left > 0:
-                chunk = source.read(min(1 << 16, self.left))
-                if not chunk:
-                    break
-                outputfile.write(chunk)
-                self.left -= len(chunk)
-
-        def log_message(self, *a):
-            pass
-
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
-
-
-def cmd_gallery(a):
-    path = "/" + S.get("gallery_path", "comfy-agent").strip("/")
-    port = int(S.get("gallery_port", 8766))
-    if a.serve:
-        gallery_server(port, path).serve_forever()
-        return
-    exe = shutil.which("tailscale")
-    if not exe:
-        raise Fail("The gallery uses Tailscale Serve, and Tailscale is not installed here.")
-    pid_file = out_dir() / ".gallery.pid"
-    if a.off:
-        subprocess.run([exe, "serve", "--bg", f"--set-path={path}", "off"], check=False)
-        if pid_file.exists():
-            with contextlib.suppress(OSError, ValueError):
-                os.kill(int(pid_file.read_text()), 15)
-            pid_file.unlink()
-        print("The gallery is off.")
-        return
-    write_index()
-    local = f"http://127.0.0.1:{port}"
+def load_marks():
+    path = out_dir() / ".comfy-agent-marks.json"
     try:
-        open_url(local + "/index.html", timeout=2).close()
-    except (urllib.error.URLError, OSError):
-        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "gallery", "--serve"],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                start_new_session=True)
-        pid_file.write_text(str(proc.pid))
-        time.sleep(1)
-    r = subprocess.run([exe, "serve", "--bg", f"--set-path={path}", local], capture_output=True, text=True)
-    if r.returncode:
-        raise Fail("tailscale serve failed: " + (r.stderr or r.stdout).strip()[:400])
-    me = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True).stdout)["Self"]
-    print(f"Gallery: https://{me['DNSName'].rstrip('.')}{path}/  (only devices on your tailnet can open it)")
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"files": {}}
+    except (OSError, ValueError) as e:
+        raise Fail(f"Cannot read review records at {path}: {e}") from None
+
+
+def redo_answered(rel):
+    """True once a redo of REL that answers its review request is queued or made: one request, one answer."""
+    state = load_state()
+    for job in [*state.get("made", {}).values(), *state.get("pending", [])]:
+        origin = (job.get("receipt") or {}).get("review") or {}
+        if origin.get("kind") == "redo" and origin.get("file") == rel and origin.get("requested_redo") is True:
+            return True
+    return False
+
+
+def rel_out(file):
+    """FILE (absolute, or relative to here or to the outputs folder) as a path inside the outputs folder."""
+    root = out_dir().resolve()
+    p = Path(file).expanduser()
+    for c in (p,) if p.is_absolute() else (Path.cwd() / p, root / p):
+        c = c.resolve()
+        if c.is_file() and root in c.parents:
+            return c.relative_to(root).as_posix()
+    raise Fail(f"Can't find {file} in {root}")
+
+
+def queue_redo(file, overrides, count=1, *, variation=False, transport="cli", by=None, request=None):
+    """Queue the recipe that made FILE again, with its settings and a new seed. overrides change settings."""
+    rel = rel_out(file)
+    made = load_state().get("made", {}).get(rel)
+    if not made:
+        raise Fail(f"There's no record of how {rel} was made (the kit keeps one for results it made), so make it "
+                   "again with run instead.")
+    folder = made.get("dir", "")
+    recipe = get_recipe(folder if folder and (Path(folder) / "card.json").exists() else made["recipe"])
+    changed = {k for k, _ in overrides}
+    keep = [(k, v) for k, v in (made.get("given") or {}).items()
+            if k in recipe.inputs and k not in changed and kind_of(k, recipe.inputs[k]) != "seed"]
+    marks = load_marks()
+    run = result_run(rel, made)
+    review = marks.get("runs", {}).get(run, {})
+    finished = review.get("done_at") if rel in review.get("files", []) else None
+    entry = marks.get("files", {}).get(rel, {}) if finished else {}
+    if variation and entry.get("mark") != "good":
+        raise Fail("A variation needs a Good result from a finished review.")
+    asked = not variation and entry.get("redo") is True and not redo_answered(rel)
+    origin = {"kind": "variation" if variation else "redo", "run": run, "file": rel, "finished_at": finished,
+              "mark": entry.get("mark", "") if finished else None, "note": entry.get("note", "") if finished else None,
+              "requested_redo": asked}
+    extra = {} if variation else {"redo_of": rel}
+    if entry.get("note"):
+        extra["note"] = entry["note"]
+    replaced = set()
+    for key, spec in recipe.inputs.items():
+        if kind_of(key, spec) == "seed":
+            spec["default"] = "random"
+            replaced.update(targets(spec))
+        elif key in changed:
+            replaced.update(targets(spec))
+    sets = [(addr, value) for addr, value in made.get("sets", []) if addr not in replaced]
+    jobs = queue_jobs(recipe, keep + list(overrides), count, sets, extra,
+                      transport=transport, by=by, request=request, review=origin)
+    note = f' (its note: {json.dumps(entry["note"])})' if entry.get("note") else ""
+    print(f"queued {len(jobs)} {origin['kind']}(s) of {rel} with {recipe.name}{note}; run {jobs[0]['run']}", flush=True)
+    return jobs
 
 
 # ---------------------------------------------------------------- list, show, doctor, config
@@ -754,17 +997,17 @@ def cmd_gallery(a):
 def cmd_list(a):
     found = all_recipes()
     if not found:
-        print("No recipes yet. Make one from a workflow: python3 comfy_agent.py add WORKFLOW.json --name NAME")
+        print(f"No recipes yet. Make one from a workflow: {cli_command()} add WORKFLOW.json --name NAME")
         return
     for name, folder in found.items():
         r = Recipe(folder)
         settings = ", ".join(k + ("*" if v.get("required") else "") for k, v in r.inputs.items())
         print(f"{name}: {r.card.get('title', '')} [{settings}]")
-    print("* = required. Details: python3 comfy_agent.py show RECIPE")
+    print(f"* = required. Details: {cli_command()} show RECIPE")
 
 
-def cmd_show(a):
-    r = get_recipe(a.recipe)
+def cmd_show(a, *, registered=False):
+    r = get_recipe(a.recipe, registered=registered)
     c = r.card
     print(f"{r.name}: {c.get('title', '')}")
     if c.get("does"):
@@ -790,14 +1033,14 @@ def cmd_show(a):
     if a.notes and notes.exists():
         print("\n" + notes.read_text(encoding="utf-8")[:4000])
     elif notes.exists():
-        print("The workflow author's notes: python3 comfy_agent.py show", r.name, "--notes")
+        print(f"The workflow author's notes: {cli_command()} show", r.name, "--notes")
 
 
 def cmd_doctor(a):
     st = comfy("/system_stats", timeout=10)
     print(f"ComfyUI {st['system'].get('comfyui_version', '?')} is up at {S['url']}.")
     for dev in st.get("devices", [])[:2]:
-        name = dev["name"].split(":")[1].strip() if ":" in dev["name"] else dev["name"]
+        name = re.sub(r"^cuda:\d+\s+", "", dev["name"]).partition(" : ")[0]
         print(f"GPU: {name}, {gb(dev.get('vram_free'))} free of {gb(dev.get('vram_total'))}.")
     q = comfy("/queue")
     print(f"Queue: {len(q['queue_running'])} running, {len(q['queue_pending'])} waiting.")
@@ -806,25 +1049,46 @@ def cmd_doctor(a):
         nodes, models = preflight(r.prompt())
         print(f"  {name}: " + ("ready" if not (nodes or models) else
                                f"not ready ({len(nodes)} node types, {len(models)} models missing). "
-                               f"python3 comfy_agent.py install {name}"))
-    targets_ = S.get("send", {})
-    print("Send to: " + (", ".join(f"{k} = {v}" for k, v in targets_.items()) or
-                         "nothing set up (python3 comfy_agent.py config phone=tailscale:DEVICE)"))
+                               f"{cli_command()} install {name}"))
+    targets_ = [f"{k} = {'ntfy' if v.startswith('ntfy:') else v}" for k, v in S.get("send", {}).items()]
+    print("Send to: " + (", ".join(targets_) or
+                         f"nothing set up ({cli_command()} config phone=tailscale:DEVICE)"))
     pending = load_state().get("pending", [])
     if pending:
-        print(f"{len(pending)} queued job(s) not collected yet: python3 comfy_agent.py wait")
+        print(f"{len(pending)} queued job(s) not collected yet: {cli_command()} wait")
+    if stats_enabled():
+        print(f"Usage stats: on, in stats.jsonl in your outputs folder; never sent anywhere. See them: {cli_command()} stats")
+
+
+RETIRED_SETTINGS = ("gallery_path", "gallery_port", "gallery_listen", "gallery_url")
 
 
 def cmd_config(a):
     cfg = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.exists() else {}
     for k, v in parse_pairs(a.values):
-        if k in ("url", "out", "gallery_path", "gallery_port", "unload_llm"):
+        if k == "stats":
+            word = {"on": "on", "yes": "on", "true": "on", "off": "off", "no": "off", "false": "off"}.get(v.strip().lower())
+            if not word:
+                raise Fail("stats is on or off: config stats=on", kind="bad setting")
+            cfg[k] = word
+        elif k in ("url", "out", "unload_llm", "install"):
             cfg[k] = v
+        elif k in RETIRED_SETTINGS:
+            raise Fail(f"{k} belongs to the review page, which is now the comfy-agent-review add-on: "
+                       f"python3 review.py config {k}=... in its folder.", kind="bad setting")
         else:
             cfg.setdefault("send", {})[k] = v
     if a.values:
         CONFIG.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-    print(json.dumps({"url": S["url"], "out": S["out"], **cfg}, indent=1))
+    keys = {k for k, _ in parse_pairs(a.values)}
+    if keys != {"stats"}:  # turning stats on or off doesn't print the other settings
+        print(json.dumps({"url": S["url"], "out": S["out"], **{k: v for k, v in cfg.items() if k not in RETIRED_SETTINGS}},
+                         indent=1))
+    if "stats" in keys:
+        print("Usage stats are on: each command adds one line to stats.jsonl in your outputs folder. The kit never "
+              f"sends it anywhere. Your totals: {cli_command()} stats" if stats_enabled() else
+              "Usage stats are off. Nothing new is kept. A log kept so far stays in stats.jsonl in your outputs folder "
+              "until you delete it.")
 
 
 # ---------------------------------------------------------------- install and restart
@@ -842,11 +1106,12 @@ def resolve_model_url(m):
     file = m["file"]
     if not url:
         return None
-    if "huggingface.co" in url:
+    source = urllib.parse.urlsplit(url)
+    if source.hostname == "huggingface.co":
         url = url.replace("/blob/", "/resolve/")
         if "/resolve/" in url:
             return url if url.rstrip("/").endswith(file) else url.rstrip("/") + "/" + file
-        repo = "/".join(urllib.parse.urlparse(url).path.strip("/").split("/")[:2])
+        repo = "/".join(source.path.strip("/").split("/")[:2])
         try:
             with open_url(f"https://huggingface.co/api/models/{repo}", headers=auth_headers(url), timeout=30) as r:
                 files = [s["rfilename"] for s in json.load(r).get("siblings", [])]
@@ -855,7 +1120,7 @@ def resolve_model_url(m):
         hit = [f for f in files if base_name(f) == file]
         return f"https://huggingface.co/{repo}/resolve/main/{hit[0]}" if hit else None
     civ = re.search(r"civitai\.com/models/\d+.*?modelVersionId=(\d+)", url)
-    if civ:
+    if source.hostname == "civitai.com" and civ:
         return f"https://civitai.com/api/download/models/{civ.group(1)}"
     return url
 
@@ -876,30 +1141,33 @@ def comfy_python(comfy_dir):
         return os.environ["COMFY_PYTHON"]
     for c in (".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe", "venv/Scripts/python.exe",
               "../python_embeded/python.exe", "../python_embedded/python.exe"):
-        p = (comfy_dir / c).resolve()
+        p = (comfy_dir / c).absolute()
         if p.exists():
             return str(p)
-    raise Fail("Can't find ComfyUI's own Python. Tell me where it is: COMFY_PYTHON=/path/to/python python3 comfy_agent.py install ...")
+    raise Fail(f"Can't find ComfyUI's own Python. Tell me where it is: COMFY_PYTHON=/path/to/python {cli_command()} install ...")
 
 
 def install_pack(pack, custom_nodes):
     comfy_dir = custom_nodes.parent
-    if shutil.which("comfy") and pack.get("id"):
+    repo = pack.get("repo")
+    if not repo:
         cmd = ["comfy", "--workspace", str(comfy_dir), "--skip-prompt", "node", "install", pack["id"]]
         print("  $", " ".join(cmd), flush=True)
         if subprocess.run(cmd).returncode == 0:
             return
-        print("  comfy-cli could not install it; trying git instead.", flush=True)
-    repo = pack.get("repo")
-    if not repo and pack.get("id"):
-        with open_url(f"https://api.comfy.org/nodes/{pack['id']}", timeout=30) as r:
-            repo = json.load(r).get("repository")
-    if not repo:
-        raise Fail(f"No download address for node pack {pack.get('id')}.")
+        raise Fail("ComfyUI could not install the node pack from the registry.")
     name = repo.rstrip("/").rsplit("/", 1)[-1]
     dest = custom_nodes / (name[:-4] if name.endswith(".git") else name)
-    if not dest.exists():
-        subprocess.run(["git", "clone", "--depth", "1", repo, str(dest)], check=True)
+    if dest.parent != custom_nodes or dest.name in ("", ".", "..") or dest.is_symlink():
+        raise Fail("Choose a repository with its own node pack folder.")
+    if dest.exists():
+        if not (dest / ".git").is_dir():
+            raise Fail("Another folder already uses this node pack's name.")
+        origin = subprocess.run(["git", "-C", str(dest), "remote", "get-url", "origin"], capture_output=True, text=True)
+        if origin.returncode or origin.stdout.strip() != repo:
+            raise Fail("The existing node pack comes from a different repository.")
+    else:
+        subprocess.run(["git", "clone", "--depth", "1", "--", repo, str(dest)], check=True)
     if (dest / "requirements.txt").exists():
         subprocess.run([comfy_python(comfy_dir), "-m", "pip", "install", "-r", str(dest / "requirements.txt")], check=True)
     if (dest / "install.py").exists():
@@ -907,19 +1175,37 @@ def install_pack(pack, custom_nodes):
 
 
 def cmd_install(a):
+    host = urllib.parse.urlsplit(S["url"]).hostname
+    if a.yes and host != "localhost":
+        try:
+            local = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            local = False
+        if not local:
+            raise Fail("Run install on the computer that runs ComfyUI, using its local address.")
     r = get_recipe(a.recipe)
     nodes, models = preflight(r.prompt())
     if not nodes and not models:
         print(f"{r.name} is ready: everything it needs is installed.")
         return
     needs = r.card.get("needs", {})
-    packs = [p for p in needs.get("nodes", []) if set(p.get("classes", [])) & set(nodes)]
+    packs = [p.copy() for p in needs.get("nodes", []) if set(p.get("classes", [])) & set(nodes)]
     unknown_nodes = [n for n in nodes if not any(n in p.get("classes", []) for p in packs)]
     by_file = {m["file"]: m for m in needs.get("models", [])}
     paths = folder_paths()
     custom_nodes = Path(paths["custom_nodes"][0])
     plan, total, todo, unknown_models = [], 0, [], []
     for p in packs:
+        if p.get("id") and not re.fullmatch(r"[a-zA-Z0-9][\w.-]*", p["id"], re.ASCII):
+            raise Fail("Use the registry name for the node pack.")
+        if not p.get("repo"):
+            if not p.get("id"):
+                raise Fail("The node pack needs a registry name or repository address.")
+            if not shutil.which("comfy"):
+                with open_url(f"https://api.comfy.org/nodes/{p['id']}", timeout=30) as response:
+                    p["repo"] = json.load(response).get("repository")
+                if not p["repo"]:
+                    raise Fail(f"No repository address for node pack {p['id']}.")
         plan.append(f"node pack {p.get('id')} from {p.get('repo') or 'the Comfy registry'} "
                     f"(code from the internet, goes in {custom_nodes})")
     for file in models:
@@ -928,9 +1214,12 @@ def cmd_install(a):
         if not m or not url or m.get("folder") not in paths:
             unknown_models.append(file)
             continue
+        root = Path(paths[m["folder"]][0]).resolve()
+        dest = root / m.get("subfolder", "") / file
+        if not dest.parent.resolve().is_relative_to(root) or dest.is_symlink() or dest.with_name(dest.name + ".part").is_symlink():
+            raise Fail("Keep the model inside its model folder.")
         size = m.get("size") or remote_size(url)
         total += size or 0
-        dest = Path(paths[m["folder"]][0]) / m.get("subfolder", "") / file
         todo.append((url, dest))
         plan.append(f"model {file}, {gb(size)}, into {dest.parent}, from {url}")
     print(f"To install for {r.name}:")
@@ -943,7 +1232,7 @@ def cmd_install(a):
     if todo:
         print(f"Download total: {gb(total)}")
     if not a.yes:
-        print(f"Nothing installed yet. Show this list to the person. With their OK: python3 comfy_agent.py install {r.name} --yes")
+        print(f"Nothing installed yet. Show this list to the person. With their OK: {cli_command()} install {r.name} --yes")
         return
     if not custom_nodes.exists():
         raise Fail("ComfyUI's folders are not on this computer. Run install on the computer that runs ComfyUI.")
@@ -954,9 +1243,9 @@ def cmd_install(a):
         print(f"Downloading {dest.name}...", flush=True)
         download(url, dest, auth_headers(url), quiet=False)
     if packs:
-        print("New node packs load when ComfyUI starts. Restart it: python3 comfy_agent.py restart")
+        print(f"New node packs load when ComfyUI starts. Restart it: {cli_command()} restart")
     else:
-        print(f"Done. Check with: python3 comfy_agent.py doctor")
+        print(f"Done. Check with: {cli_command()} doctor")
 
 
 def cmd_restart(a):
@@ -999,14 +1288,26 @@ def cmd_restart(a):
 
 def is_api_format(wf):
     return isinstance(wf, dict) and "nodes" not in wf and bool(wf) and all(
-        isinstance(v, dict) and "class_type" in v for v in wf.values())
+        isinstance(v, dict) and isinstance(v.get("class_type"), str) and isinstance(v.get("inputs"), dict)
+        for v in wf.values())
+
+
+def read_workflow(path):
+    try:
+        with path.open("rb") as f:
+            data = f.read((16 << 20) + 1)
+        if len(data) > 16 << 20:
+            raise Fail(f"{path.name} is larger than 16 MiB. Save a smaller workflow.")
+        return json.loads(data)
+    except (ValueError, RecursionError, OSError) as e:
+        raise Fail(f"Could not read {path.name} as workflow JSON ({e}).") from None
 
 
 def convert_with_comfy_cli(path):
     if not shutil.which("comfy"):
         raise Fail("To turn a saved workflow into a recipe I need comfy-cli (pip install comfy-cli), or an API "
-                   "export: in ComfyUI open the workflow, then Workflow menu > Export (API), and run\n"
-                   f"  python3 comfy_agent.py add {path} --api THE-EXPORT.json --name NAME")
+                   "export: in ComfyUI open the workflow, then Workflow menu > Export (API), and add that file "
+                   f"instead (on the command line: {cli_command()} add WORKFLOW.json --api THE-EXPORT.json --name NAME)")
     u = urllib.parse.urlparse(S["url"])
     r = subprocess.run(["comfy", "--json", "run", "--workflow", str(path), "--print-prompt", "--where", "local",
                         "--host", u.hostname or "127.0.0.1", "--port", str(u.port or 8188)],
@@ -1152,70 +1453,176 @@ def notes_text(ui):
     return "\n\n".join(out)
 
 
-def cmd_add(a):
-    src = Path(a.workflow).expanduser()
-    wf = json.loads(src.read_text(encoding="utf-8"))
-    name = slug(a.name or src.stem)
-    folder = (Path(a.into).expanduser() if a.into else KIT / "recipes") / name
-    if folder.exists() and not a.force:
-        raise Fail(f"A recipe called {name} already exists ({folder}). Pick another --name, or add --force.")
+def add_recipe(src, name=None, *, into=None, force=False, api=None, title=None, same_ok=False):
+    """Turn a saved workflow (or API export) into a recipe folder. Returns (name, folder, card)."""
+    src = Path(src).expanduser()
+    wf = read_workflow(src)
+    name = slug(name or src.stem)
+    folder = (Path(into).expanduser() if into else KIT / "recipes") / name
+    if folder.exists() and not force:
+        copy = folder / ("prompt.json" if is_api_format(wf) else "workflow.json")
+        if same_ok and copy.exists() and (folder / "card.json").exists():
+            canon = lambda x: json.dumps(x, sort_keys=True)
+            with contextlib.suppress(Fail):
+                if canon(read_workflow(copy)) == canon(wf):
+                    return name, folder, read_workflow(folder / "card.json")
+        raise Fail(f"A recipe called {name} already exists ({folder}). Pick another name.")
     if is_api_format(wf):
         prompt, ui = wf, None
     else:
+        if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
+            raise Fail("Choose a saved ComfyUI workflow or an API export.")
         ui = wf
-        prompt = json.loads(Path(a.api).expanduser().read_text(encoding="utf-8")) if a.api else convert_with_comfy_cli(src)
-    card = draft_card(prompt, ui, a.title or src.stem)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "prompt.json").write_text(json.dumps(prompt, indent=1), encoding="utf-8")
-    (folder / "card.json").write_text(json.dumps(card, indent=1), encoding="utf-8")
-    notes = notes_text(ui)
-    if notes:
-        (folder / "notes.md").write_text(notes + "\n", encoding="utf-8")
-    if ui:
-        shutil.copyfile(src, folder / "workflow.json")
+        prompt = read_workflow(Path(api).expanduser()) if api else convert_with_comfy_cli(src)
+    if not is_api_format(prompt):
+        raise Fail("Choose a ComfyUI API export for the prompt.")
+    try:
+        card = draft_card(prompt, ui, title or src.stem)
+        notes = notes_text(ui)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RecursionError):
+        raise Fail("A node in the workflow could not be read. Export the workflow again.") from None
+    # build the whole recipe beside its final place, then move it in, so a failure leaves nothing behind
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=folder.parent))
+    try:
+        (stage / "prompt.json").write_text(json.dumps(prompt, indent=1), encoding="utf-8")
+        (stage / "card.json").write_text(json.dumps(card, indent=1), encoding="utf-8")
+        if notes:
+            (stage / "notes.md").write_text(notes + "\n", encoding="utf-8")
+        if ui:
+            shutil.copyfile(src, stage / "workflow.json")
+        if folder.exists():
+            old = folder.with_name(stage.name + "-old")
+            folder.rename(old)
+            stage.rename(folder)
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            stage.rename(folder)
+    except OSError as e:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise Fail(f"Could not save the recipe {name} ({e.strerror or e}).") from None
+    STATS_CALL.recipe = "own"
+    return name, folder, card
+
+
+USEFUL_INPUT = re.compile(r"pad|strength|steps|denoise|cfg|guidance|shift|sampler|scheduler|width|height|length|"
+                          r"frames|fps|megapixels|feather|grow|blend|crop|rotation|scale|upscale|count|batch", re.I)
+NOISE_INPUT = re.compile(r"device|dtype|^type$|separator|on_missing|cache|^mtp$|template|delimiter|thinking|"
+                         r"temperature|top_[kp]|min_p|penalty|max_length", re.I)
+
+
+def other_values(folder, card, limit=24):
+    """Plain node inputs the card has no setting for, as NODE.input=current, most useful first."""
+    prompt = read_workflow(Path(folder) / "prompt.json")
+    covered = {t for spec in card.get("inputs", {}).values() for t in targets(spec)}
+    useful, rest = [], []
+    for nid, node in prompt.items():
+        if re.search(r"show|preview|note|save", node["class_type"], re.I):
+            continue
+        for field, val in node["inputs"].items():
+            addr = f"{nid}.{field}"
+            if addr in covered or isinstance(val, (list, dict)) or is_model_name(val) or NOISE_INPUT.search(field):
+                continue
+            if isinstance(val, str) and len(val) > 40:
+                continue
+            (useful if USEFUL_INPUT.search(field) else rest).append(f"{addr}={json.dumps(val)}")
+    out = useful + rest
+    return out[:limit], len(out) > limit
+
+
+def cmd_add(a):
+    name, folder, card = add_recipe(a.workflow, a.name, into=a.into, force=a.force, api=a.api, title=a.title)
     print(f"Made recipe {name} in {folder}")
     print(f"Settings found: {', '.join(card['inputs']) or 'none'}")
     print(f"Needs: {len(card['needs']['nodes'])} node pack(s), {len(card['needs']['models'])} model file(s)")
+    rest, more = other_values(folder, card)
+    if rest:
+        print("Other node inputs (one-off: --set NODE.input=VALUE): " + ", ".join(rest) + (" ..." if more else ""))
     print("Next: open card.json, give the settings clear names and help text, fill in title, does and tips,\n"
-          f"remove settings nobody should change, then test: python3 comfy_agent.py run {name} --count 1")
+          f"remove settings nobody should change, then test: {cli_command()} run {name} --count 1")
 
 
 # ---------------------------------------------------------------- MCP (stdio or HTTP)
 
+MCP_CALL_LOCK = threading.Lock()
+MCP_INSTRUCTIONS = ("Makes pictures and videos with the person's ComfyUI. Call recipes to see what can run, "
+                    "recipes with a name for its settings, then generate; it waits and returns the file paths. "
+                    "Don't read workflow files or call ComfyUI's API yourself: these tools do that in fewer tokens.")
+MCP_ADD_HINT = " A workflow file that isn't a recipe yet: recipes with add=PATH."
 MCP_TOOLS = [
     {"name": "recipes",
-     "description": "List the ComfyUI recipes (ready workflows) you can run. Give a name to see that recipe's settings and tips.",
-     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+     "description": "List the ComfyUI recipes (ready workflows) you can run. Give a name to see that recipe's settings and "
+                    "tips. To use a workflow file that is not a recipe yet, give its path as add.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"},
+         "add": {"type": "string", "description": "optional: path of a saved ComfyUI workflow (.json) to turn into a "
+                                                  "recipe; name then names the new recipe"}}}},
     {"name": "generate",
      "description": "Run a recipe: queue count results, wait for them, return the files. Unset settings keep their "
-                    "defaults. A list as a setting's value queues one job per item.",
-     "inputSchema": {"type": "object", "required": ["recipe"], "properties": {
+                    "defaults. A list as a setting's value queues one job per item. To make an earlier result again "
+                    "(same recipe and settings, new seed), give redo instead of recipe.",
+     "inputSchema": {"type": "object", "properties": {
          "recipe": {"type": "string"},
-         "settings": {"type": "object", "description": "setting name to value, e.g. {\"prompt\": \"...\"}"},
+         "redo": {"type": "string", "description": "optional: the file path of a result to make again; settings "
+                                                   "given here change it"},
+         "variation": {"type": "boolean", "description": "with redo: make a variation of a finished Good pick, not a redo request"},
+         "by": {"type": "string", "description": "optional: the caller's display name (not a URL, token or credential)"},
+         "request": {"type": "string", "description": "optional: the person's exact generation request, distinct from the image prompt"},
+         "settings": {"type": "object", "description": "setting name to value, e.g. {\"prompt\": \"...\"}; a "
+                                                       "NODE.input key such as \"23.steps\" sets that node input directly"},
          "count": {"type": "integer", "minimum": 1, "maximum": 16},
          "send": {"type": "string", "description": "optional: 'phone' (or another target from config) to also send them there"}}}},
     {"name": "results",
-     "description": "Collect jobs that were still running when generate returned.",
+     "description": "Collect pending jobs and return their results.",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
-def mcp_call(name, args, previews=True):
+def mcp_call(name, args, previews=True, *, transport="mcp-stdio"):
     buf = io.StringIO()
     done = []
     with contextlib.redirect_stdout(buf):
         if name == "recipes":
-            if args.get("name"):
-                cmd_show(argparse.Namespace(recipe=args["name"], notes=False))
+            if args.get("add"):
+                if transport != "mcp-stdio":
+                    raise Fail("Adding a workflow works on this computer only (the stdio server), not over the connector.")
+                rname, folder, card = add_recipe(args["add"], args.get("name"), same_ok=True)
+                print(f"Recipe {rname} is ready.")
+                cmd_show(argparse.Namespace(recipe=rname, notes=False), registered=True)
+                rest, more = other_values(folder, card)
+                if rest:
+                    print("Other node inputs, set in generate settings by key (e.g. {\"%s\": ...}):" % rest[0].split("=")[0])
+                    print("  " + ", ".join(rest) + (" ..." if more else ""))
+            elif args.get("name"):
+                cmd_show(argparse.Namespace(recipe=args["name"], notes=False), registered=True)
             else:
                 cmd_list(None)
         elif name == "generate":
-            r = get_recipe(args["recipe"])
-            pairs = []
+            if args.get("send"):
+                send_target(args["send"])
+            r = get_recipe(args["recipe"], registered=True) if args.get("recipe") and not args.get("redo") else None
+            pairs, raw = [], []
             for k, v in (args.get("settings") or {}).items():
+                if r and k not in r.inputs and re.fullmatch(r"[^.\s]+\.\S+", k):
+                    if transport != "mcp-stdio":
+                        raise Fail(f"{r.name} has no setting '{k}'. Its settings: {', '.join(r.inputs)}", kind="bad setting")
+                    if isinstance(v, (list, dict)):
+                        raise Fail(f"{k} takes one plain value (text, number or true/false).", kind="bad setting")
+                    raw.append((k, json.dumps(v)))  # json keeps the type: "123" stays text
+                    continue
                 pairs += [(k, x) for x in v] if isinstance(v, list) else [(k, v)]
-            jobs = queue_jobs(r, pairs, max(1, min(16, int(args.get("count") or 1))))
-            print(f"queued {len(jobs)} job(s) of {r.name}")
+            count = max(1, min(16, int(args.get("count") or 1)))
+            attribution = {"transport": transport, "by": args.get("by"), "request": args.get("request")}
+            variation = args.get("variation", False)
+            if type(variation) is not bool or (variation and not args.get("redo")):
+                raise Fail("variation must be a boolean used with redo and a finished Good pick.", kind="bad setting")
+            if args.get("redo"):
+                jobs = queue_redo(args["redo"], pairs, count, variation=variation, **attribution)
+            elif r:
+                jobs = queue_jobs(r, pairs, count, raw, **attribution)
+                print(f"queued {len(jobs)} job(s) of {r.name}; run {jobs[0]['run']}")
+            else:
+                raise Fail("generate needs a recipe, or redo with the file of a result to make again.", kind="bad setting")
             wait = "1800" if S.get("unload_llm") else "240"
             left = wait_jobs(jobs, int(os.environ.get("COMFY_AGENT_MCP_WAIT", wait)))
             done = [j for j in jobs if j not in left]
@@ -1224,8 +1631,10 @@ def mcp_call(name, args, previews=True):
                 print(send_files(files, args["send"]))
             if S.get("unload_llm") and not left:
                 free_vram()
+            check_jobs(jobs, buf.getvalue().strip())
         elif name == "results":
-            pending = load_state().get("pending", [])
+            with file_lock(state_file().with_suffix(".lock")):
+                pending = load_state().get("pending", [])
             if not pending:
                 print("No jobs are waiting.")
             else:
@@ -1235,7 +1644,7 @@ def mcp_call(name, args, previews=True):
                     free_vram()
         else:
             raise Fail(f"unknown tool {name}")
-    content = [{"type": "text", "text": buf.getvalue().strip()}]
+    content = []
     if previews:
         shown = 0
         for job in done:
@@ -1247,25 +1656,41 @@ def mcp_call(name, args, previews=True):
                 content.append({"type": "image", "mimeType": "image/jpeg",
                                 "data": base64.b64encode(comfy("/view?" + q, raw=True)).decode()})
                 shown += 1
-    return content
+    return [{"type": "text", "text": buf.getvalue().strip()}, *content]
 
 
-def mcp_handle(msg):
+def mcp_handle(msg, *, transport="mcp-stdio"):
+    if not isinstance(msg, dict) or not isinstance(msg.get("method"), str) or not isinstance(msg.get("params", {}), dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
     method, mid = msg.get("method"), msg.get("id")
     if mid is None:
         return None
     if method == "initialize":
-        result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
+        versions = ("2025-11-25", "2025-06-18")
+        offer = msg.get("params", {}).get("protocolVersion")
+        client = msg.get("params", {}).get("clientInfo")
+        if transport == "mcp-stdio":  # the HTTP server can have many clients, so only an explicit `by` names one there
+            MCP_CLIENT["agent"] = agent_label(client.get("name") if isinstance(client, dict) else None)
+        result = {"protocolVersion": offer if offer in versions else versions[0],
                   "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "comfy-agent", "version": "1.0"}}
+                  "serverInfo": {"name": "comfy-agent", "version": VERSION},
+                  "instructions": MCP_INSTRUCTIONS + (MCP_ADD_HINT if transport == "mcp-stdio" else "")}
     elif method == "tools/list":
-        result = {"tools": MCP_TOOLS}
+        tools = MCP_TOOLS
+        if transport != "mcp-stdio":  # adding reads files on this computer, so a connector never sees it
+            tools = [dict(t, description=t["description"].split(" To use a workflow file")[0],
+                          inputSchema={**t["inputSchema"], "properties": {k: v for k, v in t["inputSchema"]["properties"].items() if k != "add"}})
+                     if t["name"] == "recipes" else t for t in MCP_TOOLS]
+        result = {"tools": tools}
     elif method == "tools/call":
         p = msg.get("params") or {}
-        try:
-            result = {"content": mcp_call(p.get("name"), p.get("arguments") or {})}
-        except (Fail, ComfyError) as e:
-            result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+        with MCP_CALL_LOCK, StatsCall.for_mcp(p, transport) as call:
+            try:
+                result = {"content": mcp_call(p.get("name"), p.get("arguments") or {}, transport=transport)}
+            except (Fail, ComfyError, OSError) as e:
+                result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+                stats_failed(e)
+            call.reply(result)
     elif method == "ping":
         result = {}
     else:
@@ -1276,10 +1701,19 @@ def mcp_handle(msg):
 def cmd_mcp(a):
     if not a.http:
         out = sys.stdout
-        for line in sys.stdin:
+        if hasattr(out, "reconfigure"):
+            out.reconfigure(encoding="utf-8")
+        for line in getattr(sys.stdin, "buffer", sys.stdin):
             if not line.strip():
                 continue
-            reply = mcp_handle(json.loads(line))
+            try:
+                msg = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
+            except (ValueError, RecursionError):
+                msg = None
+            if msg is None:
+                reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            else:
+                reply = mcp_handle(msg)
             if reply is not None:
                 out.write(json.dumps(reply) + "\n")
                 out.flush()
@@ -1299,7 +1733,7 @@ def cmd_mcp(a):
                 self.send_error(404)
                 return
             msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-            reply = mcp_handle(msg)
+            reply = mcp_handle(msg, transport="mcp-http")
             if reply is None:
                 self.send_response(202)
                 self.end_headers()
@@ -1310,6 +1744,7 @@ def cmd_mcp(a):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
 
         def do_GET(self):
             self.send_error(405 if self.allowed() else 404)
@@ -1322,24 +1757,322 @@ def cmd_mcp(a):
     ThreadingHTTPServer(("127.0.0.1", a.http), Handler).serve_forever()
 
 
+# ---------------------------------------------------------------- usage stats (optional, kept in the outputs folder)
+#
+# Off unless the person runs `config stats=on`. Then each CLI command and MCP tool call adds one JSON line to
+# OUT/stats.jsonl: which command, how big the reply was, how long it took, whether it worked. Every value is a
+# number or a word from a fixed list below; nothing the person or agent typed is written, and nothing is sent.
+
+BUNDLED_RECIPES = ("klein-outpaint", "qwen-edit", "wan-i2v", "zimage")
+STATS_CLI = ("list", "show", "run", "wait", "redo", "send", "doctor", "install", "restart", "add", "config")
+STATS_MCP = ("recipes", "recipes show", "recipes add", "generate", "generate redo", "results")
+STATS_VIA = ("cli", "mcp-stdio", "mcp-http")
+STATS_ERRORS = ("model missing", "node missing", "ComfyUI not answering", "bad setting", "other")
+AGENTS = {"claude code": (), "claude": ("claude ai", "claude desktop"), "codex": ("codex cli", "codex mcp client"),
+          "pi": ("pi coding agent",), "openclaw": (), "cursor": ("cursor vscode",), "chatgpt": ("openai mcp",),
+          "gemini": ("gemini cli", "gemini cli mcp client"), "opencode": (), "goose": (), "cline": (),
+          "windsurf": ("windsurf client",), "vs code": ("visual studio code", "vscode", "copilot", "github copilot"),
+          "zed": (), "lm studio": ("lmstudio",), "aider": ()}
+AGENT_ALIASES = {alias: label for label, aliases in AGENTS.items() for alias in (label, *aliases)}
+STATS_CALL = threading.local()  # what the current call used; reset at the start of each logged call
+MCP_CLIENT = {"agent": None}  # the stdio server's one client, as it named itself when it connected
+
+
+def stats_enabled():
+    """Read the saved setting every time, so `config stats=off` also stops a server that is already running."""
+    try:
+        value = json.loads(CONFIG.read_text(encoding="utf-8")).get("stats")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return value is True or (isinstance(value, str) and value.strip().lower() == "on")
+
+
+def stats_file():
+    return out_dir() / "stats.jsonl"
+
+
+def stats_recipe(recipe):
+    """Note which recipe this call used: a recipe that comes with the kit by name, any other as "own"."""
+    try:
+        bundled = recipe.name in BUNDLED_RECIPES and recipe.folder.resolve() == (KIT / "recipes" / recipe.name).resolve()
+        STATS_CALL.recipe = recipe.name if bundled else "own"
+    except Exception:
+        pass
+    return recipe
+
+
+def stats_failed(error):
+    with contextlib.suppress(Exception):
+        STATS_CALL.error = error.kind if isinstance(error, Fail) and error.kind in STATS_ERRORS else "other"
+
+
+def agent_label(value):
+    """A known agent's name from the name the agent gave itself, "other" for anything else."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return AGENT_ALIASES.get(" ".join(re.findall(r"[a-z0-9]+", value[:200].lower())), "other")
+
+
+def refusal_kind(detail):
+    """Sort ComfyUI's refusal of a job into one of STATS_ERRORS."""
+    try:
+        error = detail.get("error") or {}
+        if error.get("type") == "missing_node_type" or "Cannot execute because node" in str(error.get("message", "")):
+            return "node missing"
+        errors = [e for ne in (detail.get("node_errors") or {}).values() for e in ne.get("errors", [])]
+        if any(e.get("type") == "value_not_in_list" and re.search(r"\.(safetensors|gguf|ckpt|pt|pth|bin|sft|onnx)\b",
+                                                                  str(e.get("details", "")), re.I) for e in errors):
+            return "model missing"
+        return "bad setting" if errors else "other"
+    except Exception:
+        return "other"
+
+
+def stats_open(path, flags):
+    """Open the log only as a plain file: never wait on a pipe or follow a link put in its place."""
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
+        flags |= getattr(os, name, 0)
+    fd = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path.name} is not a plain file")
+    return fd
+
+
+class Counted:
+    """Pass writes through to a stream and count the characters."""
+
+    def __init__(self, stream):
+        self.stream, self.chars = stream, 0
+
+    def write(self, text):
+        self.chars += len(text) if isinstance(text, str) else 0
+        return self.stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+class StatsCall:
+    """Time one command or tool call and add its line to the log. Never raises."""
+
+    def __init__(self, command, via, *, by=None, capture=False):
+        self.on, self.command, self.via, self.by, self.capture = stats_enabled(), command, via, by, capture
+        self.code, self.chars, self.images, self.image_bytes, self.streams = 0, 0, 0, 0, None
+
+    @classmethod
+    def for_mcp(cls, params, transport):
+        name, args = params.get("name"), params.get("arguments")
+        args = args if isinstance(args, dict) else {}
+        label = {"recipes": "recipes add" if args.get("add") else "recipes show" if args.get("name") else "recipes",
+                 "generate": "generate redo" if args.get("redo") else "generate", "results": "results"}
+        return cls(label.get(name, "unknown") if isinstance(name, str) else "unknown", transport, by=args.get("by"))
+
+    def __enter__(self):
+        if self.on:
+            try:
+                STATS_CALL.__dict__.clear()
+                self.start = time.monotonic()
+                if self.capture:
+                    self.streams = (sys.stdout, sys.stderr)
+                    sys.stdout, sys.stderr = Counted(sys.stdout), Counted(sys.stderr)
+            except Exception:
+                self.on = False
+        return self
+
+    def reply(self, result):
+        """Measure an MCP reply: its text, and how many pictures came with it."""
+        with contextlib.suppress(Exception):
+            for item in result.get("content", []):
+                if item.get("type") == "text":
+                    self.chars += len(item.get("text", ""))
+                elif item.get("type") == "image":
+                    data = item.get("data", "")
+                    self.images += 1
+                    self.image_bytes += len(data) * 3 // 4 - data[-2:].count("=")
+            if result.get("isError"):
+                self.code = 1
+
+    def __exit__(self, kind, error, tb):
+        if self.streams:
+            out, err = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = self.streams
+            self.chars += getattr(out, "chars", 0) + getattr(err, "chars", 0)
+        if kind is SystemExit:
+            self.code = error.code
+        elif kind is not None:
+            self.code = 1
+        if self.on and stats_enabled():  # asked again: stats may have been turned off during the call
+            with contextlib.suppress(Exception):
+                ok = self.code in (0, None)
+                agent = agent_label(self.by) or getattr(STATS_CALL, "agent", None)
+                if agent is None and self.via == "mcp-stdio":
+                    agent = MCP_CLIENT["agent"]
+                error_kind = "bad setting" if kind is SystemExit else getattr(STATS_CALL, "error", None) or "other"
+                line = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "kit": VERSION,
+                        "command": self.command, "via": self.via, "recipe": getattr(STATS_CALL, "recipe", None),
+                        "agent": agent, "reply_chars": self.chars, "reply_tokens_est": (self.chars + 3) // 4,
+                        "images": self.images, "image_bytes": self.image_bytes,
+                        "seconds": round(time.monotonic() - self.start, 1), "ok": ok, "error": None if ok else error_kind}
+                stats_file().parent.mkdir(parents=True, exist_ok=True)
+                fd = stats_open(stats_file(), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+                try:
+                    os.write(fd, (json.dumps(line) + "\n").encode())
+                finally:
+                    os.close(fd)
+        return False
+
+
+def stats_row(raw):
+    """One log line, every value checked against the fixed lists, so a summary can only hold those words."""
+    try:
+        row = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(row, dict) or not isinstance(row.get("command"), str) or type(row.get("ok")) is not bool:
+        return None
+
+    def number(key, top):
+        value = row.get(key)
+        return value if type(value) in (int, float) and 0 <= value <= top else 0
+
+    def word(key, allowed, missing=None):
+        value = row.get(key)
+        return missing if value is None else value if isinstance(value, str) and value in allowed else "other"
+
+    try:
+        when = dt.datetime.strptime(str(row.get("time"))[:20], "%Y-%m-%dT%H:%M:%SZ").date()
+    except ValueError:
+        when = None
+    return {"time": when, "command": word("command", STATS_CLI + STATS_MCP + ("marks", "gallery", "unknown")),
+            "via": word("via", STATS_VIA, "other"), "recipe": word("recipe", BUNDLED_RECIPES + ("own",)),
+            "agent": word("agent", (*AGENTS, "other")), "tokens": number("reply_tokens_est", 10 ** 9),
+            "images": number("images", 10 ** 4), "image_bytes": number("image_bytes", 10 ** 12),
+            "seconds": number("seconds", 10 ** 7), "ok": row["ok"],
+            "error": None if row["ok"] else word("error", STATS_ERRORS, "other")}
+
+
+def stats_rows():
+    """The usage log's lines; None when it is there but can't be read."""
+    try:
+        fd = stats_open(stats_file(), os.O_RDONLY)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as f:
+            return [row for row in map(stats_row, f) if row]
+    except OSError:
+        return None
+
+
+def stats_summary(rows):
+    """A few plain lines of totals: numbers, and words from the fixed lists."""
+    def listed(counter):
+        return ", ".join(f"{k} {n:,}" for k, n in counter.most_common())
+
+    def median(values):
+        return statistics.median(list(values))
+
+    agents = collections.Counter(r["agent"] for r in rows if r["agent"])
+    system = {"Darwin": "macOS"}.get(platform.system(), platform.system()) or "unknown system"
+    head = [f"comfy-agent {VERSION}", system,
+            "agent: " + (", ".join(a for a, _ in agents.most_common(3)) + " (as reported)" if agents else "not reported")]
+    days = sorted({r["time"] for r in rows if r["time"]})
+    if days:
+        span = (days[-1] - days[0]).days + 1
+        head.append(f"{span} day" + "s" * (span != 1) + (f", used on {len(days)}" if len(days) != span else ""))
+    worked = sum(r["ok"] for r in rows)
+    via = collections.Counter("cli" if r["via"] == "cli" else "mcp" if r["via"].startswith("mcp") else "other" for r in rows)
+    biggest = max(rows, key=lambda r: r["tokens"])
+    lines = [" · ".join(head),
+             f"calls {len(rows):,} · worked {worked:,} · failed {len(rows) - worked:,} · {listed(via)}",
+             f"reply tokens (estimated): median {round(median(r['tokens'] for r in rows)):,}, "
+             f"largest {round(biggest['tokens']):,} ({biggest['command']})"]
+    tools = collections.defaultdict(list)
+    for r in rows:
+        tools[r["command"]].append(r)
+    for name, group in sorted(tools.items(), key=lambda item: -len(item[1])):
+        lines.append(f"  {name}: {len(group):,} call" + "s" * (len(group) != 1)
+                     + f", median {round(median(r['tokens'] for r in group)):,},"
+                       f" largest {round(max(r['tokens'] for r in group)):,},"
+                       f" about {median(r['seconds'] for r in group):.1f} s each")
+    images = sum(r["images"] for r in rows)
+    if images:
+        size = sum(r["image_bytes"] for r in rows)
+        lines.append(f"pictures in MCP replies: {round(images):,}, "
+                     + (f"{size / 1e6:.1f} MB" if size >= 1e5 else f"{size / 1e3:.0f} KB"))
+    failures = collections.Counter(r["error"] for r in rows if not r["ok"])
+    if failures:
+        lines.append("failures: " + listed(failures))
+    recipes = collections.Counter(r["recipe"] for r in rows if r["recipe"])
+    if recipes:
+        lines.append("recipes: " + listed(recipes))
+    return "\n".join(lines) + "\n"
+
+
+def cmd_stats(a):
+    rows = stats_rows()
+    state = "on" if stats_enabled() else "off"
+    where = "stats.jsonl in your outputs folder"
+    if rows is None:
+        raise Fail(f"Can't read the usage log ({where}). Usage stats are {state}.")
+    if not rows:
+        print(f"Usage stats are {state}. Nothing is kept yet." + (" No share file was written." if a.share else "")
+              + ("" if state == "on" else " To keep a private log of how much the kit adds to your agent's tokens: "
+                 f"{cli_command()} config stats=on"))
+        return
+    summary = stats_summary(rows)
+    if not a.share:
+        print(f"Usage stats are {state}. The log is {where}; the kit never sends it anywhere.")
+        print(summary, end="")
+        switch = f"Stop: {cli_command()} config stats=off" if state == "on" else f"Turn back on: {cli_command()} config stats=on"
+        print(f"A summary you can post yourself: {cli_command()} stats --share. {switch}. "
+              f"To delete the log, delete that file ({cli_command()} config shows the outputs folder).")
+        return
+    fd, tmp = tempfile.mkstemp(dir=out_dir(), prefix=".stats-share-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(summary)
+        os.replace(tmp, out_dir() / "stats-share.txt")  # replaces a link there, never writes through it
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    print(summary)
+    print("That's the whole file: stats-share.txt in your outputs folder. The kit never uploads it. If you'd like to "
+          "help improve the kit, you can post it yourself on a GitHub issue (github.com/ausboss/comfy-agent) or in Discord.")
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(prog="comfy_agent.py", description="Make pictures and videos with ComfyUI recipes.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="the recipes")
     p = sub.add_parser("show", help="a recipe's settings")
     p.add_argument("recipe")
     p.add_argument("--notes", action="store_true", help="also print the workflow author's notes")
-    for name in ("run", "wait"):
-        p = sub.add_parser(name, help="queue a recipe and save results" if name == "run" else "collect queued jobs")
+    helps = {"run": "queue a recipe and save results", "wait": "collect queued jobs",
+             "redo": "make a result again: same recipe and settings, a new seed"}
+    for name, text in helps.items():
+        p = sub.add_parser(name, help=text)
         if name == "run":
             p.add_argument("recipe")
+        if name == "redo":
+            p.add_argument("file", help="a result to make again")
+            p.add_argument("--variation", action="store_true", help="make a variation of a finished Good pick, not a requested redo")
+        if name != "wait":
             p.add_argument("values", nargs="*", help="setting=value; repeat a setting to queue one job per value")
+            p.add_argument("--by", help="optional caller display name for the receipt, not a URL or credential")
+            p.add_argument("--request", help="optional exact generation request, distinct from the picture prompt")
             p.add_argument("--count", "-n", type=int, default=1, help="results per setting combination")
             p.add_argument("--no-wait", action="store_true", help="queue and return at once")
+        if name == "run":
             p.add_argument("--set", action="append", metavar="NODE.input=VALUE", help="set any node input directly")
         p.add_argument("--send", nargs="?", const="phone", help="also send the results (default target: phone)")
         p.add_argument("--free", action="store_true", help="unload ComfyUI's models afterwards (frees the GPU)")
@@ -1359,18 +2092,30 @@ def main(argv=None):
     p.add_argument("--api", help="the workflow's Export (API) file, if comfy-cli can't convert it")
     p.add_argument("--into", help="folder to put the recipe in (default: recipes/)")
     p.add_argument("--force", action="store_true")
-    p = sub.add_parser("gallery", help="share the results folder on your tailnet")
-    p.add_argument("--off", action="store_true")
-    p.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("config", help="show or change settings")
     p.add_argument("values", nargs="*", help="url=..., out=..., unload_llm=COMMAND, phone=tailscale:DEVICE or phone=ntfy:TOPIC")
     p = sub.add_parser("mcp", help="run as an MCP server")
     p.add_argument("--http", type=int, help="serve Streamable HTTP on this port instead of stdio")
     p.add_argument("--token", help="secret for the HTTP server")
-    a = ap.parse_args(argv)
+    p = sub.add_parser("stats", help="your own usage totals, if you turned stats on (config stats=on)")
+    p.add_argument("--share", action="store_true", help="write a short summary you can post yourself")
+    args = sys.argv[1:] if argv is None else list(argv)
+    command = next((x for x in args if not x.startswith("-")), None)
+    if command in ("mcp", "stats"):  # mcp logs each tool call; stats is the person's own look
+        return run_command(ap, args)
+    with StatsCall(command if command in STATS_CLI else "unknown", "cli", capture=True) as call:
+        call.code = run_command(ap, args)
+    return call.code
+
+
+def run_command(ap, args):
+    a = ap.parse_args(args)
+    with contextlib.suppress(Exception):
+        STATS_CALL.agent = agent_label(getattr(a, "by", None))
     try:
         globals()["cmd_" + a.cmd](a)
-    except Fail as e:
+    except (Fail, OSError) as e:
+        stats_failed(e)
         print(str(e), file=sys.stderr)
         return 1
     except ComfyError as e:
