@@ -6,7 +6,7 @@ A recipe is a folder in `recipes/`:
 |---|---|---|
 | `card.json` | the settings a person would change, and what the recipe needs | the script; the agent sees it through `show` |
 | `prompt.json` | the workflow in ComfyUI's API format, converted once | only the script |
-| `notes.md` | the workflow author's notes, from its Note nodes | the agent, through `show --notes`, when it needs them |
+| `notes.md` | the workflow author's notes, from its Note nodes | the agent: `show` prints the start (links and model lists left out), `show --notes` all of it |
 | `workflow.json` | the original workflow, to convert again later | nobody at run time |
 
 The agent never opens `prompt.json`. That's the point: a workflow file is 4,000 to 20,000 tokens, and its

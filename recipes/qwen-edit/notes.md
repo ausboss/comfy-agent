@@ -1,3 +1,21 @@
+## 🆎 AusBoss
+
+Qwen Image 2.1 Edit + Realign
+
+Change a picture in plain words, and the edit lines up with the original.
+
+[▶ AusBoss on YouTube](https://www.youtube.com/@ausbossdev) · videos on these nodes and workflows
+
+---
+
+1. Load your image.
+2. Say the change in plain words.
+3. Run.
+
+When you move an arm or a hand, say where it ends up. Otherwise Qwen can keep the old pose and add a new hand.
+
+Needs AusBoss nodes 2.3.0 or newer.
+
 ## Note
 
 ## These two boxes write the full instruction, then make the edit and line it up with your image. Double-click one to see inside.

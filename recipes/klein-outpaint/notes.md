@@ -1,3 +1,26 @@
+## 🆎 AusBoss
+
+Klein 9B Outpaint
+
+Extend a picture, and Klein 9B paints the new area.
+
+[▶ AusBoss on YouTube](https://www.youtube.com/@ausbossdev) · videos on these nodes and workflows
+
+---
+
+1. Load your image.
+2. Pick a ratio, or drag the orange handles out.
+3. Optional: describe the new area in **What goes there**, after the first sentence.
+4. Press **Run**.
+
+Keep that first sentence. Without it the new area can come out blank.
+
+A big pad can grow a second hand or face near your picture's edge. If it does, extend in two runs.
+
+The result is about 1.6 MP, whatever size your picture is.
+
+Needs AusBoss nodes newer than 2.4.0 (update first).
+
 ## Note
 
 ## These two boxes write the prompt from your image, then paint and put your image back. Double-click one to see inside.

@@ -47,7 +47,10 @@ All five made the pictures. One run each, so read it as a demonstration, not a b
 
 1. Keep graphs out of the context. Convert once, store the API format, and let a script fill in values.
 2. Show a short menu first (`list` is one line a recipe) and details only on request (`show`, then
-   `show --notes`).
+   `show --notes`). What the author says a run needs (a trigger word, a sentence to keep) is the one
+   exception: `show` prints the start of the notes, and a recipe's first run prints its card instead of
+   queueing when the agent skipped it. A trigger word that sat only in the notes was missed in 17 of 18
+   runs (three agents, command line and MCP) until the notes came to the agent this way; then in none of 18.
 3. Few tools, each doing a whole job: `generate` queues, waits, downloads and reports in one call.
 4. Return file paths and seeds, not JSON, logs or base64. Send a small preview only to clients that can't open
    files.

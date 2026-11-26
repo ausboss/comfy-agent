@@ -13,7 +13,10 @@ Don't open the recipe files or call ComfyUI's API yourself: the script does that
 
 1. `python3 comfy_agent.py list` shows the recipes: one line each, with their settings (`*` = required).
    Pick the one that fits. If none does, say so and stop.
-2. `python3 comfy_agent.py show RECIPE` shows its settings, defaults and tips. Follow the tips.
+2. `python3 comfy_agent.py show RECIPE` shows its settings, defaults, tips and the workflow author's notes.
+   Follow the tips and notes (a trigger word, for one, goes in the prompt). If the request needs more than
+   these settings, read the rest of the notes (`show RECIPE --notes`) and set the node input it needs with
+   `--set NODE.input=VALUE` (`show` lists them).
 3. `python3 comfy_agent.py run RECIPE setting=value ... --count 4` queues 4, waits, saves them and prints
    each file's path and seed. Quote values with spaces: `prompt="a red fox in the snow"`.
    - Different versions: give a setting more than once, one job each: `prompt="a cat" prompt="a dog"`.

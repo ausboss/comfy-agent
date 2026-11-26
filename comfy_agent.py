@@ -812,6 +812,10 @@ def cmd_run(a):
     if a.send:
         send_target(a.send)
     recipe = get_recipe(a.recipe)
+    if card_unseen(recipe, "cli"):
+        card_first(recipe, "run the command")
+        cmd_show(argparse.Namespace(recipe=a.recipe, notes=False))
+        return 2
     jobs = queue_jobs(recipe, parse_pairs(a.values), max(1, a.count), parse_pairs(a.set or []),
                       by=getattr(a, "by", None), request=getattr(a, "request", None))
     print(f"queued {len(jobs)} job(s) of {recipe.name}; run {jobs[0]['run']}", flush=True)
@@ -994,7 +998,7 @@ def queue_redo(file, overrides, count=1, *, variation=False, transport="cli", by
 
 # ---------------------------------------------------------------- list, show, doctor, config
 
-def cmd_list(a):
+def cmd_list(a, via="cli"):
     found = all_recipes()
     if not found:
         print(f"No recipes yet. Make one from a workflow: {cli_command()} add WORKFLOW.json --name NAME")
@@ -1003,10 +1007,86 @@ def cmd_list(a):
         r = Recipe(folder)
         settings = ", ".join(k + ("*" if v.get("required") else "") for k, v in r.inputs.items())
         print(f"{name}: {r.card.get('title', '')} [{settings}]")
-    print(f"* = required. Details: {cli_command()} show RECIPE")
+    how = f"{cli_command()} show RECIPE" if via == "cli" else "recipes with name=RECIPE"
+    print(f"* = required. Before a recipe's first run, read its card (settings, tips, author's notes): {how}")
 
 
-def cmd_show(a, *, registered=False, notes_how=None):
+def note_noise(s):
+    """A line of the notes an agent can do without: rules, links, tables, short headings, one-word lines."""
+    if re.fullmatch(r"[-=*_ ]{3,}", s) or "](http" in s or re.match(r"(https?://|\||```)", s) or re.search("[├└│📂]", s):
+        return True
+    if s.startswith("#"):
+        return len(s.lstrip("# ").split()) <= 6
+    return " " not in s
+
+
+def notes_brief(text, limit=700):
+    """The author's notes, short enough to print with every recipe: headings, rules and links dropped, cut at a
+    line once past `limit` characters. Returns (text, whether anything was cut)."""
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not note_noise(s):
+            lines.append(re.sub(r"^#+ *", "", s).replace("**", ""))
+    out, size = [], 0
+    for i, s in enumerate(lines):
+        if out and size + len(s) > limit:
+            return "\n".join(out), True
+        out.append(s if len(s) <= limit else s[:limit] + "...")
+        size += len(s) + 1
+    return "\n".join(out), any(len(s) > limit for s in lines)
+
+
+CARD_SEEN = {}  # recipe name -> notes it was shown with, for this stdio MCP session
+SEEN_HOURS = 3  # the command line and the connector have no session: a card stays read this long
+
+
+def seen_file():
+    return out_dir() / ".comfy-agent-seen.json"
+
+
+def notes_key(recipe):
+    """A hash of the notes `show` prints for a recipe, or None when it has nothing to say."""
+    f = recipe.folder / "notes.md"
+    brief = notes_brief(f.read_text(encoding="utf-8"))[0] if f.exists() else ""
+    return hashlib.sha256(brief.encode()).hexdigest()[:16] if brief else None
+
+
+def mark_seen(recipe, transport):
+    key = notes_key(recipe)
+    if not key:
+        return
+    if transport == "mcp-stdio":
+        CARD_SEEN[recipe.name] = key
+        return
+    with file_lock(seen_file().with_suffix(".lock")):
+        try:
+            seen = json.loads(seen_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = {}
+        seen[recipe.name] = {"notes": key, "at": time.time()}
+        write_json(seen_file(), seen)
+
+
+def card_unseen(recipe, transport):
+    """True when the recipe's author left notes that this session (or the last few hours) hasn't been shown."""
+    key = notes_key(recipe)
+    if not key:
+        return False
+    if transport == "mcp-stdio":
+        return CARD_SEEN.get(recipe.name) != key
+    try:
+        seen = json.loads(seen_file().read_text(encoding="utf-8")).get(recipe.name) or {}
+    except (OSError, ValueError, AttributeError):
+        seen = {}
+    return seen.get("notes") != key or time.time() - seen.get("at", 0) > SEEN_HOURS * 3600
+
+
+def card_first(recipe, how):
+    print(f"Not queued yet: read {recipe.name}'s card first. Follow its tips and the author's notes, then {how} again.\n")
+
+
+def cmd_show(a, *, registered=False, via="cli", transport="cli"):
     r = get_recipe(a.recipe, registered=registered)
     c = r.card
     print(f"{r.name}: {c.get('title', '')}")
@@ -1029,11 +1109,21 @@ def cmd_show(a, *, registered=False, notes_how=None):
         print(f"  {key}: {spec.get('help', '')} ({'; '.join(bits)})")
     for tip in c.get("tips", []):
         print("Tip:", tip)
+    rest, more = other_values(r.folder, c, limit=10) if (r.folder / "prompt.json").exists() else ([], False)
+    if rest:
+        how = "--set NODE.input=VALUE" if via == "cli" else 'generate settings by key, e.g. {"%s": ...}' % rest[0].split("=")[0].split(" ")[0]
+        print(f"Other node inputs ({how}): " + ", ".join(rest) + (" ..." if more else ""))
     notes = r.folder / "notes.md"
+    mark_seen(r, transport)
     if a.notes and notes.exists():
         print("\n" + notes.read_text(encoding="utf-8")[:4000])
     elif notes.exists():
-        print("The workflow author's notes:", notes_how or f"{cli_command()} show {r.name} --notes")
+        brief, cut = notes_brief(notes.read_text(encoding="utf-8"))
+        if brief:
+            print("Workflow author's notes (follow them):\n" + brief)
+        if cut:
+            how = f"{cli_command()} show {r.name} --notes" if via == "cli" else f"recipes with name={r.name} and notes=true"
+            print(f"The rest of the notes, for a request these settings don't cover: {how}")
 
 
 def cmd_doctor(a):
@@ -1443,14 +1533,34 @@ def find_folder(file):
     return None
 
 
+NOTE_NODE = re.compile(r"note|label|comment|readme|instruction", re.I)
+
+
 def notes_text(ui):
-    out = []
+    """The author's notes: Note and Markdown Note nodes, note cards saved as JSON (title, subtitle, body),
+    and other note-like nodes. Cards come first: they are usually the workflow's how-to."""
+    cards, out = [], []
     for n in ui_nodes(ui) if ui else []:
-        if n.get("type") in ("Note", "MarkdownNote") and n.get("widgets_values"):
-            text = str(n["widgets_values"][0]).strip()
-            if text:
-                out.append(f"## {n.get('title') or n['type']}\n\n{text}")
-    return "\n\n".join(out)
+        typ = str(n.get("type") or "")
+        values = n.get("widgets_values")
+        if not NOTE_NODE.search(typ) or not isinstance(values, list):
+            continue
+        texts, is_card = [], False
+        for v in values:
+            if not isinstance(v, str) or not v.strip():
+                continue
+            try:
+                card = json.loads(v)
+            except ValueError:
+                card = None
+            if isinstance(card, dict):
+                is_card = True
+                texts += [card[k].strip() for k in ("title", "subtitle", "body") if isinstance(card.get(k), str) and card[k].strip()]
+            else:
+                texts.append(v.strip())
+        if texts:
+            (cards if is_card else out).append(f"## {n.get('title') or typ}\n\n" + "\n\n".join(texts))
+    return "\n\n".join(cards + out)
 
 
 def add_recipe(src, name=None, *, into=None, force=False, api=None, title=None, same_ok=False):
@@ -1512,10 +1622,11 @@ NOISE_INPUT = re.compile(r"device|dtype|^type$|separator|on_missing|cache|^mtp$|
 
 
 def other_values(folder, card, limit=24):
-    """Plain node inputs the card has no setting for, as NODE.input=current, most useful first."""
+    """Plain node inputs the card has no setting for, as NODE.input=current, most useful first: text first
+    (named by its node's title, cut short), then numbers and choices that change the result."""
     prompt = read_workflow(Path(folder) / "prompt.json")
     covered = {t for spec in card.get("inputs", {}).values() for t in targets(spec)}
-    useful, rest = [], []
+    texts, useful, rest = [], [], []
     for nid, node in prompt.items():
         if re.search(r"show|preview|note|save", node["class_type"], re.I):
             continue
@@ -1524,9 +1635,14 @@ def other_values(folder, card, limit=24):
             if addr in covered or isinstance(val, (list, dict)) or is_model_name(val) or NOISE_INPUT.search(field):
                 continue
             if isinstance(val, str) and len(val) > 40:
+                if not val.lstrip().startswith(("[", "{")):  # a list or settings saved as JSON is not text to change
+                    title = (node.get("_meta") or {}).get("title") or node["class_type"]
+                    texts.append(f"{addr} ({title})={json.dumps(val[:40] + '...', ensure_ascii=False)}")
                 continue
-            (useful if USEFUL_INPUT.search(field) else rest).append(f"{addr}={json.dumps(val)}")
-    out = useful + rest
+            if isinstance(val, float):
+                val = round(val, 4)
+            (useful if USEFUL_INPUT.search(field) else rest).append(f"{addr}={json.dumps(val, ensure_ascii=False)}")
+    out = texts + useful + rest
     return out[:limit], len(out) > limit
 
 
@@ -1551,8 +1667,8 @@ MCP_INSTRUCTIONS = ("Makes pictures and videos with the person's ComfyUI. Call r
 MCP_ADD_HINT = " A workflow file that isn't a recipe yet: recipes with add=PATH."
 MCP_TOOLS = [
     {"name": "recipes",
-     "description": "List the ComfyUI recipes (ready workflows) you can run. Give a name to see that recipe's settings and "
-                    "tips. To use a workflow file that is not a recipe yet, give its path as add.",
+     "description": "List the ComfyUI recipes (ready workflows) you can run. Give a name to see that recipe's settings, "
+                    "tips and author's notes. To use a workflow file that is not a recipe yet, give its path as add.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"},
          "notes": {"type": "boolean", "description": "with name: also return the workflow author's notes"},
@@ -1589,17 +1705,12 @@ def mcp_call(name, args, previews=True, *, transport="mcp-stdio"):
                     raise Fail("Adding a workflow works on this computer only (the stdio server), not over the connector.")
                 rname, folder, card = add_recipe(args["add"], args.get("name"), same_ok=True)
                 print(f"Recipe {rname} is ready.")
-                cmd_show(argparse.Namespace(recipe=rname, notes=False), registered=True,
-                         notes_how=f"recipes with name={rname} and notes=true")
-                rest, more = other_values(folder, card)
-                if rest:
-                    print("Other node inputs, set in generate settings by key (e.g. {\"%s\": ...}):" % rest[0].split("=")[0])
-                    print("  " + ", ".join(rest) + (" ..." if more else ""))
+                cmd_show(argparse.Namespace(recipe=rname, notes=False), registered=True, via="mcp", transport=transport)
             elif args.get("name"):
-                cmd_show(argparse.Namespace(recipe=args["name"], notes=args.get("notes") is True), registered=True,
-                         notes_how=f"recipes with name={args['name']} and notes=true")
+                cmd_show(argparse.Namespace(recipe=args["name"], notes=args.get("notes") is True), registered=True, via="mcp",
+                         transport=transport)
             else:
-                cmd_list(None)
+                cmd_list(None, via="mcp")
         elif name == "generate":
             if args.get("send"):
                 send_target(args["send"])
@@ -1621,6 +1732,10 @@ def mcp_call(name, args, previews=True, *, transport="mcp-stdio"):
                 raise Fail("variation must be a boolean used with redo and a finished Good pick.", kind="bad setting")
             if args.get("redo"):
                 jobs = queue_redo(args["redo"], pairs, count, variation=variation, **attribution)
+            elif r and card_unseen(r, transport):
+                card_first(r, "call generate")
+                cmd_show(argparse.Namespace(recipe=r.name, notes=False), registered=True, via="mcp", transport=transport)
+                return [{"type": "text", "text": buf.getvalue().strip()}]
             elif r:
                 jobs = queue_jobs(r, pairs, count, raw, **attribution)
                 print(f"queued {len(jobs)} job(s) of {r.name}; run {jobs[0]['run']}")
@@ -2116,7 +2231,7 @@ def run_command(ap, args):
     with contextlib.suppress(Exception):
         STATS_CALL.agent = agent_label(getattr(a, "by", None))
     try:
-        globals()["cmd_" + a.cmd](a)
+        code = globals()["cmd_" + a.cmd](a)
     except (Fail, OSError) as e:
         stats_failed(e)
         print(str(e), file=sys.stderr)
@@ -2126,7 +2241,7 @@ def run_command(ap, args):
         return 1
     except KeyboardInterrupt:
         return 130
-    return 0
+    return code if isinstance(code, int) else 0
 
 
 if __name__ == "__main__":

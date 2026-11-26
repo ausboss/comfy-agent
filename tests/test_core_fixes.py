@@ -83,6 +83,7 @@ class RunnerTest(unittest.TestCase):
         self.out = self.root / 'out'
         stack.enter_context(mock.patch.dict(ca.S, url='http://localhost', out=str(self.out), send={}, recipes=[str(folder.parent)], unload_llm=None))
         stack.enter_context(mock.patch.dict(ca._node_info, clear=True))
+        stack.enter_context(mock.patch.dict(ca.CARD_SEEN, clear=True))
         stack.enter_context(mock.patch.object(ca, 'comfy', side_effect=self.fake))
         stack.enter_context(mock.patch.object(ca, 'download', side_effect=self.fake.download))
         self.stdout = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -572,21 +573,93 @@ with mock.patch.dict(ca.S, out=output, unload_llm=None), mock.patch.object(ca, '
         self.assertEqual(sent['7']['inputs']['steps'], 4)
 
     def test_mcp_reads_the_author_notes_on_request(self):
-        (self.recipe.folder / 'notes.md').write_text('Use the trigger word zorbleaf.\n')
+        long_tail = "\n\n".join(f"How part {i} works, in some detail." for i in range(40))
+        (self.recipe.folder / 'notes.md').write_text('## Read me\n\nUse the trigger word zorbleaf.\n\n' + long_tail + '\n')
         for transport in ('mcp-stdio', 'mcp-http'):
             with self.subTest(transport=transport):
                 card = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
                     'name': 'test'}}}, transport=transport)['result']['content'][0]['text']
-                self.assertNotIn('zorbleaf', card)  # notes stay out of the card until asked for
+                self.assertIn('Use the trigger word zorbleaf.', card)  # the start of the notes comes with every card
+                self.assertNotIn('part 39', card)                       # the rest waits until asked for
                 self.assertIn('recipes with name=test and notes=true', card)  # a hint an MCP client can follow
                 self.assertNotIn('--notes', card)
                 full = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
                     'name': 'test', 'notes': True}}}, transport=transport)['result']['content'][0]['text']
-                self.assertIn('Use the trigger word zorbleaf.', full)
+                self.assertIn('How part 39 works', full)
         listed = ca.mcp_handle({'method': 'tools/list', 'id': 1}, transport='mcp-http')['result']['tools']
         self.assertIn('notes', listed[0]['inputSchema']['properties'])
         ca.cmd_show(argparse.Namespace(recipe='test', notes=False), registered=True)
         self.assertIn('show test --notes', self.stdout.getvalue())  # the command line keeps its own hint
+
+    def test_short_notes_print_whole_without_links_trees_or_rules(self):
+        text = ("## Read me\n\nTrigger word: cl4ymation. Start every prompt with it.\n\n---\n\n## Model links\n\n"
+                "- [model.safetensors](https://example.com/model.safetensors)\n\n| GPU | time |\n\n```\n"
+                "📂 ComfyUI/\n├── 📂 models/\n```\n\ntext_encoders\n\n**Keep 8 steps.**\n")
+        brief, cut = ca.notes_brief(text)
+        self.assertEqual(brief, "Trigger word: cl4ymation. Start every prompt with it.\nKeep 8 steps.")
+        self.assertFalse(cut)
+        (self.recipe.folder / 'notes.md').write_text(text)
+        ca.cmd_show(argparse.Namespace(recipe='test', notes=False), registered=True)
+        out = self.stdout.getvalue()
+        self.assertIn("notes (follow them):\nTrigger word: cl4ymation.", out)
+        self.assertNotIn('--notes', out)  # nothing left out, so no pointer to the rest
+
+    def test_first_run_of_a_recipe_with_notes_shows_its_card_instead(self):
+        self.fake.on_submit = lambda pid: (self.fake.finish(pid) or {'prompt_id': pid})
+        self.assertEqual(ca.main(['run', 'test', 'prompt=fox']), 0)  # no notes: nothing to read first
+        self.assertEqual(len(self.fake.submitted), 1)
+        notes = self.recipe.folder / 'notes.md'
+        notes.write_text('Trigger word: zorbleaf. Start every prompt with it.\n')
+        self.assertEqual(ca.main(['run', 'test', 'prompt=fox']), 2)
+        self.assertEqual(len(self.fake.submitted), 1)               # not queued
+        self.assertIn("Not queued yet: read test's card first", self.stdout.getvalue())
+        self.assertIn('Trigger word: zorbleaf.', self.stdout.getvalue())
+        self.assertEqual(ca.main(['run', 'test', 'prompt=zorbleaf, fox']), 0)  # read now, so it runs
+        self.assertEqual(len(self.fake.submitted), 2)
+        notes.write_text('Trigger word: quillmoss.\n')                # new notes are new reading
+        self.assertEqual(ca.main(['run', 'test', 'prompt=fox']), 2)
+        ca.main(['show', 'test'])
+        self.assertEqual(ca.main(['run', 'test', 'prompt=quillmoss, fox']), 0)
+        seen = json.loads((self.out / '.comfy-agent-seen.json').read_text())
+        with mock.patch.object(ca.time, 'time', return_value=seen['test']['at'] + 4 * 3600):
+            self.assertEqual(ca.main(['run', 'test', 'prompt=fox']), 2)  # a later session reads it again
+        # MCP: the stdio session remembers what it has shown, and a redo is never held back
+        reply = self.call('generate', {'recipe': 'test', 'settings': {'prompt': 'fox'}})
+        self.assertFalse(reply.get('isError'))
+        self.assertTrue(reply['content'][0]['text'].startswith("Not queued yet"))
+        self.assertIn('Trigger word: quillmoss.', reply['content'][0]['text'])
+        count = len(self.fake.submitted)
+        self.assertIn('queued 1 job(s)', self.call('generate', {'recipe': 'test', 'settings': {'prompt': 'fox'}})['content'][0]['text'])
+        self.assertEqual(len(self.fake.submitted), count + 1)
+        ca.CARD_SEEN.clear()
+        self.call('recipes', {'name': 'test'})                    # reading the card first means no hold-up
+        self.assertIn('queued 1 job(s)', self.call('generate', {'recipe': 'test', 'settings': {'prompt': 'fox'}})['content'][0]['text'])
+        listed = self.call('recipes', {})['content'][0]['text']
+        self.assertIn("read its card (settings, tips, author's notes): recipes with name=RECIPE", listed)
+
+    def test_notes_include_note_cards_and_long_text_inputs_are_offered(self):
+        card = json.dumps({"v": 1, "title": "Outpaint", "subtitle": "Extend a picture.",
+                           "body": "Describe the new area in What goes there, after the first sentence."})
+        ui = {"nodes": [{"type": "Note", "title": "Tip", "widgets_values": ["Keep 4 steps."]},
+                        {"type": "AUSBOSS_NODES_WorkflowNote", "title": "Read me", "widgets_values": [card]},
+                        {"type": "KSampler", "widgets_values": [1, "fixed", 4]}],
+              "definitions": {"subgraphs": [{"nodes": [{"type": "MarkdownNote", "widgets_values": ["Inside."]}]}]}}
+        text = ca.notes_text(ui)
+        self.assertTrue(text.startswith("## Read me\n\nOutpaint\n\nExtend a picture.\n\nDescribe the new area"))
+        self.assertIn("Keep 4 steps.", text)
+        self.assertIn("Inside.", text)
+        self.assertNotIn("fixed", text)
+        prompt = json.loads((self.recipe.folder / 'prompt.json').read_text())
+        prompt['30'] = {'class_type': 'AUSBOSS_NODES_Text', '_meta': {'title': 'What goes there'},
+                        'inputs': {'text': 'outpaint, replace all solid gray areas with the scene around them.'}}
+        prompt['31'] = {'class_type': 'LoraList', 'inputs': {'loras': '[{"name": "a.safetensors", "strength": 1}]', 'shift': 5.000000000000001}}
+        (self.recipe.folder / 'prompt.json').write_text(json.dumps(prompt))
+        rest, _ = ca.other_values(self.recipe.folder, self.recipe.card)
+        self.assertEqual(rest[0], '30.text (What goes there)="outpaint, replace all solid gray areas w..."')
+        self.assertIn('31.shift=5.0', rest)
+        self.assertFalse(any(x.startswith('31.loras') for x in rest))  # settings saved as JSON are not text
+        ca.cmd_show(argparse.Namespace(recipe='test', notes=False), registered=True)
+        self.assertIn('--set NODE.input=VALUE): 30.text (What goes there)', self.stdout.getvalue())
 
     def test_mcp_add_refused_over_http(self):
         reply = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
