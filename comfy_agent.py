@@ -1006,7 +1006,7 @@ def cmd_list(a):
     print(f"* = required. Details: {cli_command()} show RECIPE")
 
 
-def cmd_show(a, *, registered=False):
+def cmd_show(a, *, registered=False, notes_how=None):
     r = get_recipe(a.recipe, registered=registered)
     c = r.card
     print(f"{r.name}: {c.get('title', '')}")
@@ -1033,7 +1033,7 @@ def cmd_show(a, *, registered=False):
     if a.notes and notes.exists():
         print("\n" + notes.read_text(encoding="utf-8")[:4000])
     elif notes.exists():
-        print(f"The workflow author's notes: {cli_command()} show", r.name, "--notes")
+        print("The workflow author's notes:", notes_how or f"{cli_command()} show {r.name} --notes")
 
 
 def cmd_doctor(a):
@@ -1555,6 +1555,7 @@ MCP_TOOLS = [
                     "tips. To use a workflow file that is not a recipe yet, give its path as add.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"},
+         "notes": {"type": "boolean", "description": "with name: also return the workflow author's notes"},
          "add": {"type": "string", "description": "optional: path of a saved ComfyUI workflow (.json) to turn into a "
                                                   "recipe; name then names the new recipe"}}}},
     {"name": "generate",
@@ -1588,13 +1589,15 @@ def mcp_call(name, args, previews=True, *, transport="mcp-stdio"):
                     raise Fail("Adding a workflow works on this computer only (the stdio server), not over the connector.")
                 rname, folder, card = add_recipe(args["add"], args.get("name"), same_ok=True)
                 print(f"Recipe {rname} is ready.")
-                cmd_show(argparse.Namespace(recipe=rname, notes=False), registered=True)
+                cmd_show(argparse.Namespace(recipe=rname, notes=False), registered=True,
+                         notes_how=f"recipes with name={rname} and notes=true")
                 rest, more = other_values(folder, card)
                 if rest:
                     print("Other node inputs, set in generate settings by key (e.g. {\"%s\": ...}):" % rest[0].split("=")[0])
                     print("  " + ", ".join(rest) + (" ..." if more else ""))
             elif args.get("name"):
-                cmd_show(argparse.Namespace(recipe=args["name"], notes=False), registered=True)
+                cmd_show(argparse.Namespace(recipe=args["name"], notes=args.get("notes") is True), registered=True,
+                         notes_how=f"recipes with name={args['name']} and notes=true")
             else:
                 cmd_list(None)
         elif name == "generate":

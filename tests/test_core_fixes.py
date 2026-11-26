@@ -1,4 +1,5 @@
 """Exercise the runner through the CLI and MCP with an in-memory ComfyUI."""
+import argparse
 import contextlib
 import copy
 import io
@@ -569,6 +570,23 @@ with mock.patch.dict(ca.S, out=output, unload_llm=None), mock.patch.object(ca, '
             self.assertFalse(reply.get('isError'), reply)
         sent = self.fake.submitted[-1]['prompt']
         self.assertEqual(sent['7']['inputs']['steps'], 4)
+
+    def test_mcp_reads_the_author_notes_on_request(self):
+        (self.recipe.folder / 'notes.md').write_text('Use the trigger word zorbleaf.\n')
+        for transport in ('mcp-stdio', 'mcp-http'):
+            with self.subTest(transport=transport):
+                card = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
+                    'name': 'test'}}}, transport=transport)['result']['content'][0]['text']
+                self.assertNotIn('zorbleaf', card)  # notes stay out of the card until asked for
+                self.assertIn('recipes with name=test and notes=true', card)  # a hint an MCP client can follow
+                self.assertNotIn('--notes', card)
+                full = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
+                    'name': 'test', 'notes': True}}}, transport=transport)['result']['content'][0]['text']
+                self.assertIn('Use the trigger word zorbleaf.', full)
+        listed = ca.mcp_handle({'method': 'tools/list', 'id': 1}, transport='mcp-http')['result']['tools']
+        self.assertIn('notes', listed[0]['inputSchema']['properties'])
+        ca.cmd_show(argparse.Namespace(recipe='test', notes=False), registered=True)
+        self.assertIn('show test --notes', self.stdout.getvalue())  # the command line keeps its own hint
 
     def test_mcp_add_refused_over_http(self):
         reply = ca.mcp_handle({'method': 'tools/call', 'id': 1, 'params': {'name': 'recipes', 'arguments': {
