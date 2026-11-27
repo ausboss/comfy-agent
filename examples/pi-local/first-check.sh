@@ -23,12 +23,20 @@ read -r -p "Continue only if nothing above is someone else's GPU work. Continue?
 [ "$ok" = y ] || exit 1
 
 say "llama.cpp b12808"
-if [ ! -x "$T/llama.cpp/build/bin/llama-server" ]; then
-  git clone --depth 1 --branch b12808 https://github.com/ggml-org/llama.cpp "$T/llama.cpp" &&
+LS="${LLAMA_SERVER:-$T/llama.cpp/build/bin/llama-server}"
+if [ ! -x "$LS" ]; then
+  miss=""; command -v cmake >/dev/null || miss="$miss cmake"; command -v nvcc >/dev/null || [ -x /opt/cuda/bin/nvcc ] || miss="$miss nvcc"
+  if [ -n "$miss" ]; then
+    echo "MISSING:$miss. Install the build tools (Arch: sudo pacman -S cmake cuda; Ubuntu: sudo apt install cmake nvidia-cuda-toolkit),"
+    echo "or point LLAMA_SERVER at an existing llama-server built from tag b12808, then run this again."
+    exit 1
+  fi
+  export PATH="$PATH:/opt/cuda/bin"
+  [ -d "$T/llama.cpp/.git" ] || git clone --depth 1 --branch b12808 https://github.com/ggml-org/llama.cpp "$T/llama.cpp" || { echo "CLONE FAILED"; exit 1; }
   cmake -S "$T/llama.cpp" -B "$T/llama.cpp/build" -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release &&
   cmake --build "$T/llama.cpp/build" -j"$(nproc)" --target llama-server || { echo "BUILD FAILED"; exit 1; }
 fi
-"$T/llama.cpp/build/bin/llama-server" --version
+"$LS" --version
 
 say "model"
 base=https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4af51b3542f775b0a8e4b310bfb3f17e01c306c9
@@ -39,7 +47,7 @@ echo "7b20f0679da6f5c6ec7971e241630f44fe1e123e5c99bfea90c433268b355723  $M/Qwen3
 
 say "router"
 PORT=8080; curl -s -m 2 http://127.0.0.1:8080/health >/dev/null && PORT=8091
-MODELS=~/models/pi-local LLAMA_SERVER="$T/llama.cpp/build/bin/llama-server" PORT=$PORT \
+MODELS=~/models/pi-local LLAMA_SERVER="$LS" PORT=$PORT \
   nohup "$here/start-router.sh" > "$T/router.log" 2>&1 &
 rp=$!
 for i in $(seq 60); do curl -s -m 2 "http://127.0.0.1:$PORT/models" >/dev/null && break; sleep 1; done
