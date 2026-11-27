@@ -9,7 +9,7 @@ versions: [examples/pi-local/versions.json](../examples/pi-local/versions.json).
 
 | Machine | GPU | Router probe | Pilot (2 cycles) | 20 cycles | Timeout, crash, memory checks |
 |---|---|---|---|---|---|
-| arch3090 | RTX 3090 24 GB, Ampere | **pass** (real, 2026-11-27) | not run | not run | not run |
+| arch3090 | RTX 3090 24 GB, Ampere | **pass** (real, 2026-11-27) | **pass** krea2 2/2, qwen-edit 2/2 (real) | waiting for review | not run |
 | arch5090 | RTX 5090 32 GB, Blackwell | not run | not run | not run | not run |
 | Legion | RTX 3070 Laptop 8 GB | M2 | M2 | M2 | M2 |
 | metro-a5000 | RTX A5000 24 GB, 15 GB RAM | M2 | M2 | M2 | M2 |
@@ -70,6 +70,20 @@ sha256 OK. Router on :8080 with `start-router.sh`. Test ComfyUI 0.45.3 idle on :
 | Loaded footprint | 16,326 MiB used on the card (model + desktop + idle ComfyUI); ComfyUI saw 7,828 MiB free |
 | Unload, 2 rounds | 0.5 s each, back to 833 MiB used / 23,322 MiB free in ComfyUI |
 | After | router stopped, 833 MiB used, same as before |
+
+### arch3090, 2026-11-27 ~09:45 UTC: 2-cycle Pi pilots, pass
+
+Pi 1.6.1 in RPC mode, Qwen3.8-27B UD-Q3_K_XL 32K on the llama.cpp `b12808` router (`--no-models-autoload`), kit at
+`gpu-handoff-lifecycle` db63579 with `inference.type=llama-router`, ComfyUI 0.45.3, torch 2.11.0+cu128, driver
+615.78.08. `cycle_driver.py --pilot`; VRAM sampled every 0.5 s with nvidia-smi per process.
+
+| Recipe | Cycles | Peak VRAM (MiB) | Phases (avg) | Notes |
+|---|---|---|---|---|
+| krea2 (int8, local recipe) | 2/2 pass | 20,061 total; model 15,564, ComfyUI 19,452, never together while rendering; 0 violations | unload 0.5 s, render 29.6 s, free 0.5 s, restore 4.0 s | Turns 44 s and 54 s. Pi called `recipes` then `generate`; follow-up named the seed; every reply from local/qwen38-27b. Pictures checked: fox asleep in snow, lighthouse at dusk |
+| qwen-edit on a portrait | 2/2 (the summary said 1/2: checker bug, a two-digit seed; fixed) | 22,515 total; 0 violations | render ~104 s | Edits correct: night with full moon, then snow, same person kept |
+
+After: router stopped, 1,089 MiB used (the test ComfyUI's own process grew from 256 to 508 MiB after rendering).
+zimage not installed on arch3090: /home has 3 GB free.
 
 Load times are with the file in the OS page cache (second read onward); a cold first load will be slower. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
 recipe, kit commit, peak VRAM per side, co-residency violations, and time to unload, render, free and reload
