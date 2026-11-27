@@ -1068,6 +1068,8 @@ def reconcile(include_blocked=False, only=None, quiet=True):
             continue
         if not j.claim(op["id"], op["heartbeat"]):
             continue
+        if op["state"] == "blocked":
+            j.set_op(op["id"], state="queued", error=None)
         spawn_runner(op["id"])
         started.append(op["id"])
         if not quiet:

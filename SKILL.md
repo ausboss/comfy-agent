@@ -56,3 +56,4 @@ delete settings nobody should change, and fill in `title`, `does` and `tips` (th
 - Ask before installing anything and before deleting anything. Nothing else needs a question.
 - Don't change ComfyUI's settings, its other workflows, or files outside this folder's `outputs/`.
 - Never say a result is good without looking at it.
+- If a run prints `BLOCKED`, tell the person what it says and don't run it again.

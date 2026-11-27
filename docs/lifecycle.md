@@ -40,7 +40,8 @@ Recommended for Pi on a shared card: llama.cpp `llama-server` in router mode sta
 `--no-models-autoload`, and `inference.type=llama-router`. The server then refuses to load a model by itself,
 so a stray request during a render gets an error instead of loading into a full card. With llama-swap the kit
 uses `POST /api/models/pause` and `/resume` when the build has them (they reject requests while paused), and
-falls back to a plain unload, where only convention stops a reload.
+falls back to a plain unload, where only convention stops a reload. The router honours a per-request
+`?autoload=true` even with `--no-models-autoload`; pi's built-in llama.cpp provider sends `autoload=false`.
 
 ## The managed sequence
 
@@ -110,7 +111,7 @@ The older `.comfy-agent-jobs.json` is read once and its pending jobs moved into 
 
 | Command | Does |
 |---|---|
-| `run`, `wait` | unchanged flags. In managed mode they follow the runner and print the lines below |
+| `run`, `wait` | unchanged flags. In managed mode they follow the runner and print the lines below. `run --no-wait` returns at once only with `llama-router` (the server can't reload by itself); with other adapters it waits anyway |
 | `ops [OP] [--json]` | recent operations: state, error, per-phase timings and free memory |
 | `cancel [OP]` | cancel one operation, or every unfinished one |
 | `reconcile` | restart a runner for any unfinished operation whose runner died, and retry `blocked` ones |
@@ -135,12 +136,20 @@ BLOCKED: memory not released (9.1 GB free, need 15.4 GB). The language model sta
 
 ## MCP
 
-Still three tools. `generate` follows the operation for up to `COMFY_AGENT_MCP_WAIT` seconds (1,800 in managed
-mode, 240 otherwise) and then returns the `still rendering` line with the operation id instead of an error.
-If the request carries a `progressToken`, the server sends a progress notification every 10 s.
+Still three tools. In managed mode `generate` follows the operation until it ends, which is after the model is
+back: a client whose own model is unloaded can't read an early answer (with the llama.cpp router, pi's next
+model call gets `400 model is not loaded` and the turn ends). It returns early only when the client cancels the
+request or after `COMFY_AGENT_MCP_WAIT` seconds (default 10,800), with the `still rendering` line and the
+operation id. In unmanaged mode it waits 240 s, as before.
+
+If the request carries a `progressToken`, the server sends `notifications/progress` every 10 s. pi 1.6.1 sends a
+token on every call and resets its 60 s per-request timeout on each notification (checked by the GPU thread
+with a fake server), so long renders don't time out there.
+
 `results` takes two optional arguments: `operation` (follow just that one) and `cancel: true`. It returns each
-file once. The stdio server answers requests in parallel and honours `notifications/cancelled`, so a client
-that gave up on `generate` can call `results` straight away.
+file once. The stdio server answers requests in parallel and honours `notifications/cancelled` (it stops
+following and sends no answer for that request; the operation goes on), so a client that gave up on
+`generate` can call `results` straight away.
 
 ## `ops --json`
 

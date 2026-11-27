@@ -5,7 +5,7 @@ Let any AI agent make pictures and videos with your ComfyUI, from plain English.
 > "Make me four pictures of a cabin in the snow, turn the best one into a video, and send them to my phone."
 
 Claude Code, Codex, pi, OpenClaw, Cursor, or a small local model: they all can run a command, so they all can
-use this. It's one Python file with no dependencies, a short instruction file for the agent, and **recipes**:
+use this. It's one Python script (plus one helper module) with no dependencies, a short instruction file for the agent, and **recipes**:
 your workflows, each converted once into a form an agent can use without reading the whole graph.
 
 **AI agents: read [SKILL.md](SKILL.md) and follow it.**
@@ -82,15 +82,18 @@ More in [docs/phone.md](docs/phone.md).
 
 ## A local model on a 16 GB card
 
-A 27B model and an image model don't fit on a 16 GB card together, but they can take turns. Tell the kit how
-to unload your model, and every run takes it off the card first, waits for the results, then frees ComfyUI's
-memory so the model loads back on the agent's next turn:
+A 27B model and an image model don't fit on a 16 GB card together, but they can take turns. Tell the kit
+where your model server is, and every run takes the model off the card, renders, frees ComfyUI's memory,
+checks there is room again, and loads the model back. A background process owns each handoff, so a timed-out
+or closed agent never leaves the card in a half-way state:
 
 ```bash
-python3 comfy_agent.py config unload_llm="curl -s http://127.0.0.1:8080/unload"     # llama-swap
+python3 comfy_agent.py config inference.type=llama-router inference.url=http://127.0.0.1:8080   # llama.cpp router
+python3 comfy_agent.py config inference.type=llama-swap inference.url=http://127.0.0.1:8080     # llama-swap
 ```
 
-Setup for llama-swap, LM Studio and Ollama, and what it costs in time: [docs/local-models.md](docs/local-models.md).
+Setup, other servers and what it costs in time: [docs/local-models.md](docs/local-models.md). How the handoff
+works, step by step: [docs/lifecycle.md](docs/lifecycle.md). `comfy_agent.py ops` shows recent handoffs.
 
 ## ChatGPT and Claude apps
 
