@@ -1,6 +1,7 @@
 """Tests for comfy_agent.py against a fake ComfyUI server. Run: python3 -m unittest discover -s tests"""
 import base64
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,18 @@ CARD = {"title": "Test", "inputs": {
     "image": {"set": "8.image", "type": "image", "default": "example.png"}}}
 
 
+def cleanup(tmp):
+    """Close the journals first: Windows can't delete a file that is still open."""
+    for j in ca._journals.values():
+        j.close()
+    ca._journals.clear()
+    try:
+        tmp.cleanup()
+    except OSError:
+        import shutil
+        shutil.rmtree(tmp.name, ignore_errors=True)
+
+
 class ComfyAgentTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -122,6 +135,7 @@ class ComfyAgentTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        os.environ["COMFY_AGENT_LEASE_DIR"] = str(root / "lease")
         ca.S["out"] = str(root / "out")
         ca.S["send"] = {}
         ca._node_info.clear()
@@ -133,7 +147,7 @@ class ComfyAgentTest(unittest.TestCase):
         Fake.uploads.clear()
 
     def tearDown(self):
-        self.tmp.cleanup()
+        cleanup(self.tmp)
 
     def recipe(self):
         return ca.get_recipe(str(self.recipe_dir))

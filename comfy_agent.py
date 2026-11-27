@@ -46,8 +46,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from comfy_lifecycle import (JOB_FINAL, OP_FINAL, AdapterError, Journal, Lease, free_mb, make_adapter, new_op_id,
-                             pid_alive)
+from comfy_lifecycle import (JOB_FINAL, OP_FINAL, AdapterError, Journal, Lease, default_lease_dir, free_mb,
+                             make_adapter, new_op_id, pid_alive)
 
 KIT = Path(__file__).resolve().parent
 CONFIG = KIT / "comfy-agent.local.json"
@@ -442,6 +442,12 @@ def managed():
     return inference_cfg()["type"] != "none"
 
 
+def lease_dir():
+    """The GPU lease's folder: inference.lease_dir, else one per computer shared by every output folder."""
+    d = inference_cfg().get("lease_dir")
+    return Path(d).expanduser() if d else default_lease_dir()
+
+
 def journal():
     path = out_dir() / ".comfy-agent.db"
     j = _journals.get(str(path))
@@ -828,7 +834,8 @@ class Runner:
         self.data = self.op["data"]
         self.cfg = self.data.get("inference") or inference_cfg()
         self.adapter = make_adapter(self.cfg)
-        self.lease = Lease(out_dir())
+        self.lease = Lease(self.cfg.get("lease_dir") or lease_dir())
+        self._guard_at = 0.0
         self._stop = threading.Event()
 
     def event(self, text):
@@ -850,6 +857,35 @@ class Runner:
         self.j.set_op(self.id, data={"vram_mb": {**self.j.op(self.id)["data"].get("vram_mb", {}), key: mb}})
         return mb
 
+    def waiting(self, holder):
+        holder = holder or {}
+        where = ""
+        if holder.get("out") and Path(holder["out"]) != out_dir():
+            where = f" (output folder {holder['out']})"
+        self.event(f"waiting for the GPU: operation {holder.get('op', '(unknown)')}{where} has it")
+
+    def guard(self, force=False):
+        """While we hold the lease the model must stay off the card. With the llama.cpp router a request that
+        asks for ?autoload=true still loads it, and an older llama-swap loads on any request. Catch that and
+        unload again. This shortens the overlap; it can't prevent it."""
+        if self.adapter.kind not in ("llama-router", "llama-swap") or not (force or time.time() - self._guard_at > 2):
+            return
+        self._guard_at = time.time()
+        try:
+            back = self.adapter.loaded()
+        except AdapterError:
+            return
+        if not back:
+            return
+        self.event(f"a request loaded the language model ({', '.join(back)}) while ComfyUI had the GPU; "
+                   "unloaded it again")
+        self.j.append(self.id, "notes", f"intrusion: {', '.join(back)} loaded during the lease")
+        self.adapter.unload(back)
+
+    def note_once(self, text):
+        if text not in self.j.op(self.id)["data"].get("notes", []):
+            self.j.append(self.id, "notes", text)
+
     def names(self, models):
         if self.adapter.kind == "command" and not self.cfg.get("model"):
             return ""
@@ -866,9 +902,8 @@ class Runner:
         held = False
         try:
             t = time.time()
-            held = self.lease.acquire(self.id, poll=0.2, should_stop=self.cancelled,
-                                      on_wait=lambda h: self.event(
-                                          f"waiting for the GPU: operation {(h or {}).get('op', '(unknown)')} has it"))
+            held = self.lease.acquire({"op": self.id, "out": str(out_dir())}, poll=0.2, should_stop=self.cancelled,
+                                      on_wait=self.waiting)
             self.op = self.j.op(self.id)
             if self.op["state"] in ("done", "failed", "cancelled"):
                 return
@@ -946,6 +981,7 @@ class Runner:
                     last_check = time.time()
                 poll_jobs(self.j, left, check_lost=check)
                 down_since = None
+                self.guard()
             except Fail:
                 down_since = down_since or time.time()
                 if time.time() - down_since > float(self.cfg.get("down_timeout", 120)):
@@ -978,6 +1014,7 @@ class Runner:
             limit = time.time() + float(self.cfg.get("idle_timeout", 3600))
             told = False
             while comfy_busy():
+                self.guard()
                 if not told:
                     self.event("waiting for ComfyUI's queue to empty before the language model comes back")
                     told = True
@@ -988,12 +1025,19 @@ class Runner:
             t = time.time()
             self.state("freeing")
             free_vram()
+            if models and not need:
+                self.note_once("no free-memory check: the unload freed nothing ComfyUI could see (another GPU, "
+                               "unified memory, or a GPU ComfyUI can't measure). Set inference.need_mb to check anyway")
             if models and need:
                 want = need + int(self.cfg.get("margin_mb", 512))
                 limit = time.time() + float(self.cfg.get("free_timeout", 180))
                 while True:
+                    self.guard()
                     have = comfy_free_mb()
-                    if have is None or have >= want:
+                    if have is None:
+                        self.note_once("no free-memory check: ComfyUI reports no GPU memory figure for this device")
+                        break
+                    if have >= want:
                         break
                     if time.time() > limit:
                         self.vram("after_free")
@@ -1030,14 +1074,19 @@ class Runner:
 def spawn_runner(op_id):
     logs = out_dir() / ".runs"
     logs.mkdir(parents=True, exist_ok=True)
-    kw = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT, "cwd": str(KIT)}
-    if os.name == "nt":
-        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        kw["start_new_session"] = True
+    kw = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT, "cwd": str(KIT), "close_fds": True}
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_runner", "--out", str(out_dir()), op_id]
     with open(logs / f"{op_id}.log", "ab") as log:
-        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_runner", "--out", str(out_dir()), op_id],
-                             stdout=log, **kw)
+        if os.name == "nt":
+            # Its own process group, no console, and out of the client's job object when that is allowed, so an
+            # MCP client that kills its server's process tree doesn't kill the runner.
+            detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:
+                p = subprocess.Popen(cmd, stdout=log, creationflags=detached | 0x01000000, **kw)  # BREAKAWAY_FROM_JOB
+            except OSError:
+                p = subprocess.Popen(cmd, stdout=log, creationflags=detached, **kw)
+        else:
+            p = subprocess.Popen(cmd, stdout=log, start_new_session=True, **kw)
     _children.append(p)
     journal().set_op(op_id, pid=p.pid, heartbeat=time.time())
     return p
@@ -1081,7 +1130,7 @@ def start_managed(recipe, pairs, count=1, raw_sets=(), send=None):
     jobs = build_jobs(recipe, pairs, count, raw_sets)
     op_id = new_op_id()
     data = {"settings": {"url": S["url"], "out": S["out"], "send": S.get("send", {})},
-            "inference": inference_cfg(), "send": send, "events": [], "phases": {}, "vram_mb": {}}
+            "inference": {**inference_cfg(), "lease_dir": str(lease_dir())}, "send": send, "events": [], "phases": {}, "vram_mb": {}}
     j = journal()
     j.create_op(op_id, "managed", recipe.name, data, jobs)
     j.set_op(op_id, heartbeat=time.time())
@@ -1507,7 +1556,8 @@ def cmd_doctor(a):
         return
     reconcile()
     print("Local model: " + make_adapter(cfg).describe())
-    holder = Lease(out_dir()).holder() if Lease(out_dir()).held_by_anyone() else None
+    lease = Lease(lease_dir())
+    holder = lease.holder() if lease.held_by_anyone() else None
     print("GPU lease: " + (f"held by operation {holder.get('op')}" if holder else "free"))
     j = journal()
     for o in j.ops(limit=50, unfinished=True) + j.blocked_ops():

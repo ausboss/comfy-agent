@@ -11,6 +11,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -204,12 +205,26 @@ class Journal:
 
 # ---------------------------------------------------------------- lease
 
+def default_lease_dir():
+    """Where the GPU lease lives unless configured: a per-user folder on this computer, shared by every copy of
+    the kit and every output folder, and on a local disk (file locks are unreliable on network shares)."""
+    if os.environ.get("COMFY_AGENT_LEASE_DIR"):
+        return Path(os.environ["COMFY_AGENT_LEASE_DIR"]).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "comfy-agent"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "comfy-agent"
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "comfy-agent"
+
+
 class Lease:
-    """One GPU lease per output folder: an OS file lock, dropped by the OS if the holder dies.
+    """The GPU lease: an OS file lock, dropped by the OS if the holder dies. By default one per computer
+    (default_lease_dir), so two kits with different output folders still take turns.
     flock locks belong to the open file, so two threads of one process also exclude each other."""
 
-    def __init__(self, folder):
-        self.folder = Path(folder)
+    def __init__(self, folder=None):
+        self.folder = Path(folder).expanduser() if folder else default_lease_dir()
         self.lock_path = self.folder / ".gpu.lock"
         self.info_path = self.folder / ".gpu.lease.json"
         self.fd = None
@@ -251,10 +266,15 @@ class Lease:
                 return False
             time.sleep(poll)
         self.fd = fd
-        info = {"op": owner, "pid": os.getpid(), "host": socket.gethostname(), "since": now()}
-        tmp = self.info_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(info), encoding="utf-8")
-        tmp.replace(self.info_path)
+        info = dict(owner) if isinstance(owner, dict) else {"op": owner}
+        info.update(pid=os.getpid(), host=socket.gethostname(), since=now())
+        tmp = self.folder / f".gpu.lease.{os.getpid()}.tmp"
+        try:  # only a label for people and error messages; the lock itself is already held
+            tmp.write_text(json.dumps(info), encoding="utf-8")
+            tmp.replace(self.info_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
         return True
 
     def release(self):
@@ -289,7 +309,7 @@ def pid_alive(pid):
     if not pid:
         return False
     if os.name == "nt":
-        return True  # no cheap check; the heartbeat decides
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -297,6 +317,24 @@ def pid_alive(pid):
     except PermissionError:
         return True
     return True
+
+
+def _win_pid_alive(pid):
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.GetLastError() == 5  # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        return True  # can't tell; the heartbeat decides
 
 
 # ---------------------------------------------------------------- inference adapters
@@ -526,7 +564,8 @@ def free_mb(stats, device=0):
 
     vram_free includes memory PyTorch has reserved but isn't using; only ComfyUI can use that part, so it
     is taken off. Returns None when ComfyUI reports no GPU (CPU-only), so no check is possible."""
-    devices = [d for d in (stats or {}).get("devices", []) if d.get("type") != "cpu"]
+    # cpu has no card to share; DirectML ("privateuseone") reports a fixed placeholder, not real free memory
+    devices = [d for d in (stats or {}).get("devices", []) if d.get("type") not in ("cpu", "privateuseone", "directml")]
     if not devices:
         return None
     d = devices[min(int(device), len(devices) - 1)]

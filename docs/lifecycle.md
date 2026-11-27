@@ -33,6 +33,7 @@ In `comfy-agent.local.json` (or the `COMFY_AGENT_INFERENCE` environment variable
 | `inference.idle_timeout` | `3600` | seconds to wait for ComfyUI's queue to empty (browser jobs) before the reload |
 | `inference.load_timeout` | `300` | seconds for the model to report ready |
 | `inference.device` | `0` | index into `/system_stats` `devices` |
+| `inference.lease_dir` | per computer (below) | folder for the GPU lease. Also `COMFY_AGENT_LEASE_DIR` |
 
 `unload_llm=COMMAND` keeps working and means `{"type": "command", "unload": COMMAND}`.
 
@@ -42,6 +43,9 @@ so a stray request during a render gets an error instead of loading into a full 
 uses `POST /api/models/pause` and `/resume` when the build has them (they reject requests while paused), and
 falls back to a plain unload, where only convention stops a reload. The router honours a per-request
 `?autoload=true` even with `--no-models-autoload`; pi's built-in llama.cpp provider sends `autoload=false`.
+To cover those gaps the runner checks the model server every 2 s while it holds the lease (render, idle wait,
+free). If a model came back, it unloads it again and records an `intrusion` note. That shortens an overlap; it
+can't prevent one.
 
 ## The managed sequence
 
@@ -68,7 +72,8 @@ reports a running or pending job; one unload and at most one load per lease.
 
 ## Operation states
 
-`queued` → `unloading` → `submitting` → `rendering` → `idle-wait` → `freeing` → `restoring` → one of:
+`queued` → `unloading` → `submitting` → `rendering` → `idle-wait` → `freeing` → `restoring` → one of
+(a `blocked` operation that `reconcile` retries goes back to `queued`):
 
 | Final state | Meaning |
 |---|---|
@@ -101,11 +106,21 @@ A job's files are returned to the caller once: `delivered` is set when a `run`, 
 All in the output folder (`out`, default `outputs/`):
 
 - `.comfy-agent.db`: the journal (SQLite, WAL). Tables `ops` and `jobs`; read it with `ops --json`, not SQL.
-- `.gpu.lock`: the lease, an OS file lock. The OS drops it when the holder dies. `.gpu.lease.json` says who
-  holds it.
 - `.runs/OP.log`: the runner's output for that operation.
 
 The older `.comfy-agent-jobs.json` is read once and its pending jobs moved into the journal.
+
+The GPU lease is **one per computer**, not per output folder, so two copies of the kit (or two output folders)
+on one card still take turns. It lives in `$XDG_STATE_HOME/comfy-agent/` (default `~/.local/state/comfy-agent/`)
+on Linux, `~/Library/Application Support/comfy-agent/` on macOS and `%LOCALAPPDATA%\comfy-agent\` on Windows:
+
+- `.gpu.lock`: the lease, an OS file lock (`flock`, or `msvcrt.locking` on Windows). The OS drops it when the
+  holder dies.
+- `.gpu.lease.json`: who holds it (`op`, `out`, `pid`, `host`, `since`).
+
+Set `inference.lease_dir` to give each card its own lease on a computer with several. Keep the lease and the
+journal on a local disk: file locks and SQLite are unreliable on network shares. A blocked operation is only
+restored by a later operation from the same output folder (or by `reconcile` there).
 
 ## Commands
 
@@ -163,7 +178,16 @@ One object per operation:
  "after_free": 22900}, "notes": []}
 ```
 
-`phases` are seconds spent in each step. `vram_mb` is free device memory as ComfyUI reports it.
+`phases` are seconds spent in each step. `vram_mb` is free device memory as ComfyUI reports it (`null` when
+ComfyUI has no figure: CPU, DirectML). `notes` holds `intrusion: ...` when the guard above fired, and
+`no free-memory check: ...` when the headroom check couldn't run.
+
+## Platforms
+
+The runner is a detached process: a new session on Linux and macOS; on Windows its own process group with no
+console, and out of the client's job object when the job allows it, so a client that kills its server's
+process tree doesn't kill the render. CI runs the tests on Linux (Python 3.9 and 3.13), macOS and Windows,
+against fake servers. Real-GPU results are per machine in `docs/hardware-results.md`.
 
 ## Not covered in milestone 1
 

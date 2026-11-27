@@ -6,7 +6,6 @@ llama.cpp router / llama-swap sharing those books. No GPU. Run: python3 -m unitt
 import io
 import json
 import os
-import signal
 import sys
 import tempfile
 import threading
@@ -33,6 +32,18 @@ def run_args(recipe, *values, count=1, no_wait=False, timeout=60, send=None):
                                  send=send, free=False, timeout=timeout)
 
 
+def cleanup(tmp):
+    """Close the journals first: Windows can't delete a file that is still open."""
+    for j in ca._journals.values():
+        j.close()
+    ca._journals.clear()
+    try:
+        tmp.cleanup()
+    except OSError:
+        import shutil
+        shutil.rmtree(tmp.name, ignore_errors=True)
+
+
 class Base(unittest.TestCase):
     adapter = "llama-router"
 
@@ -47,6 +58,7 @@ class Base(unittest.TestCase):
         self.comfy_url, self.router_url, self.swap_url = (u for _, u in self.servers)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        os.environ["COMFY_AGENT_LEASE_DIR"] = str(root / "lease")
         self.saved = dict(ca.S)
         ca.S.update(url=self.comfy_url, out=str(root / "out"), send={})
         ca.S.pop("unload_llm", None)
@@ -77,7 +89,7 @@ class Base(unittest.TestCase):
         ca._journals.clear()
         ca.S.clear()
         ca.S.update(self.saved)
-        self.tmp.cleanup()
+        cleanup(self.tmp)
 
     # helpers
     def out(self, fn, *a, **kw):
@@ -113,7 +125,7 @@ class Base(unittest.TestCase):
         sent = [s for s in self.world.submits if s]
         self.assertEqual(len(sent), len(set(sent)), "a prompt was submitted twice")
         self.assertEqual(self.world.violations, [])
-        self.assertFalse(cl.Lease(ca.out_dir()).held_by_anyone(), "the lease was not released")
+        self.assertFalse(cl.Lease(ca.lease_dir()).held_by_anyone(), "the lease was not released")
 
 
 class HappyPath(Base):
@@ -246,7 +258,7 @@ class Crashes(Base):
             op_id = ca.start_managed(ca.get_recipe(str(self.recipe)), [("prompt", "x")], 2)
         self.wait_for(lambda: len(self.events("submit")) == 2, 10, "both submits")
         proc = ca._children[-1]
-        os.kill(proc.pid, signal.SIGKILL)
+        proc.kill()  # SIGKILL on Linux and macOS, TerminateProcess on Windows
         proc.wait()
         self.assertEqual(self.op(op_id)["state"], "rendering")
         self.assertTrue(ca.runner_dead(self.op(op_id)))
@@ -358,11 +370,20 @@ class Memory(Base):
         self.assertEqual(self.op(first["id"])["state"], "done")
         self.assertIs(self.world.llm_loaded["qwen"], True)
 
+    def test_a_gpu_comfyui_cant_measure_skips_the_check_and_says_so(self):
+        self.world.device_type = "privateuseone"  # DirectML reports a placeholder, not free memory
+        self.out(ca.cmd_run, run_args(str(self.recipe), "prompt=x"))
+        op = self.op()
+        self.assertEqual(op["state"], "done")
+        self.assertTrue(any(n.startswith("no free-memory check") for n in op["data"]["notes"]), op["data"])
+        self.assertIs(self.world.llm_loaded["qwen"], True)
+
     def test_free_mb_takes_off_what_pytorch_reserved(self):
         stats = {"devices": [{"type": "cuda", "vram_free": 10 * fakes.MiB * 1024, "torch_vram_free": 2 * fakes.MiB * 1024}]}
         self.assertEqual(cl.free_mb(stats), 8 * 1024)
         self.assertIsNone(cl.free_mb({"devices": [{"type": "cpu", "vram_free": 1}]}))
         self.assertIsNone(cl.free_mb({"devices": []}))
+        self.assertIsNone(cl.free_mb({"devices": [{"type": "privateuseone", "vram_free": 1 << 30}]}))
 
 
 class Sharing(Base):
@@ -392,6 +413,48 @@ class Sharing(Base):
         both = outs[0].getvalue() + outs[1].getvalue()
         self.assertIn("waiting for the GPU: operation", both)
         self.assertEqual(both.count("restored the language model"), 2)
+        self.assert_clean()
+
+    def test_two_output_folders_share_one_lease(self):
+        self.world.render_time = 0.8
+        recipe = ca.get_recipe(str(self.recipe))
+        outs = [str(Path(self.tmp.name) / "out-a"), str(Path(self.tmp.name) / "out-b")]
+        ids = []
+        for out in outs:
+            ca.S["out"] = out
+            with ca.contextlib.redirect_stdout(io.StringIO()):
+                ids.append(ca.start_managed(recipe, [("prompt", "x")], 1))
+            time.sleep(0.3)
+        for out, op_id in zip(outs, ids):
+            ca.S["out"] = out
+            self.assertEqual(self.wait_op(op_id)["state"], "done")
+        second = self.op(ids[1])["data"]["events"]
+        self.assertTrue(any(f"waiting for the GPU: operation {ids[0]} (output folder {outs[0]})" in e[1]
+                            for e in second), second)
+        seq = [e["what"] for e in self.world.events if e["what"] in ("llm-unload", "llm-load")]
+        self.assertEqual(seq, ["llm-unload", "llm-load", "llm-unload", "llm-load"])
+        self.assert_clean()
+
+    def test_a_request_that_loads_the_model_mid_render_is_undone(self):
+        """The router obeys ?autoload=true even with --no-models-autoload; the runner unloads it again."""
+        self.world.render_time = 3.0
+
+        def intruder():
+            self.wait_for(lambda: self.events("start"), 10, "render to start")
+            time.sleep(0.3)
+            with self.world.lock:
+                self.world.llm_loaded["qwen"] = True
+            self.world.log("intrusion")
+        threading.Thread(target=intruder, daemon=True).start()
+        text = self.out(ca.cmd_run, run_args(str(self.recipe), "prompt=x"))
+        self.assertIn("a request loaded the language model (qwen) while ComfyUI had the GPU; unloaded it again", text)
+        intruded = self.events("intrusion")[0]["t"]
+        undone = [e["t"] for e in self.events("llm-unload") if e["t"] > intruded]
+        self.assertTrue(undone and undone[0] - intruded < 3, "the intrusion was not undone within 3 s")
+        self.assertLess(undone[0], self.events("end")[0]["t"], "undone only after the render ended")
+        self.assertIn("intrusion: qwen loaded during the lease", self.op()["data"]["notes"])
+        self.assertEqual(self.op()["state"], "done")
+        self.assertIs(self.world.llm_loaded["qwen"], True)
         self.assert_clean()
 
     def test_a8_browser_job_running_at_reload_time_delays_the_reload(self):
@@ -448,6 +511,7 @@ class Unmanaged(Base):
         self.assertIn("queued 2 job(s) of test\n", text)
         self.assertIn("done 2/2", text)
         self.assertFalse((ca.out_dir() / ".gpu.lock").exists())
+        self.assertFalse((ca.lease_dir() / ".gpu.lock").exists())
         self.assertFalse((ca.out_dir() / ".runs").exists())
         self.assertEqual(ca._children, children)
         self.assertEqual(self.events("llm-unload"), [])
@@ -513,6 +577,33 @@ class Pieces(unittest.TestCase):
             self.assertFalse(b.held_by_anyone())
             self.assertTrue(b.acquire("op-b", timeout=1))
             b.release()
+
+    def test_lease_dir_is_per_computer_by_default(self):
+        old = {k: os.environ.pop(k, None) for k in ("COMFY_AGENT_LEASE_DIR", "XDG_STATE_HOME")}
+        try:
+            d = cl.default_lease_dir()
+            if os.name == "nt":
+                self.assertEqual(d.name, "comfy-agent")
+            elif sys.platform == "darwin":
+                self.assertEqual(d, Path.home() / "Library" / "Application Support" / "comfy-agent")
+            else:
+                self.assertEqual(d, Path.home() / ".local" / "state" / "comfy-agent")
+                os.environ["XDG_STATE_HOME"] = "/x/state"
+                self.assertEqual(cl.default_lease_dir(), Path("/x/state/comfy-agent"))
+            os.environ["COMFY_AGENT_LEASE_DIR"] = "/somewhere"
+            self.assertEqual(cl.default_lease_dir(), Path("/somewhere"))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_pid_alive(self):
+        self.assertTrue(cl.pid_alive(os.getpid()))
+        p = ca.subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertFalse(cl.pid_alive(p.pid))
+        self.assertFalse(cl.pid_alive(None))
 
     def test_unknown_adapter_is_refused(self):
         with self.assertRaises(cl.AdapterError):

@@ -132,5 +132,7 @@ model fails to load after a picture, lower `-c` to 16384, which saved about 450 
   heads and made more pictures; every fox had one head. If it starts redoing work, ask it to show you the
   pictures and let you judge.
 - There's nothing to unload with a cloud model (Claude, Codex, ChatGPT), so leave `inference` unset for those.
-- One output folder, one lease. Two copies of the kit with different output folders on one card don't see each
-  other's lease.
+- The GPU lease is one per computer, so two copies of the kit on one card take turns. With several cards, give
+  each its own: `inference.lease_dir=/some/folder` ([lifecycle.md](lifecycle.md)).
+- If a request loads the model back in the middle of a render (an older llama-swap, or a client that asks the
+  router for `autoload=true`), the kit unloads it again within about 2 seconds and notes it in `ops`.

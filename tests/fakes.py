@@ -42,6 +42,7 @@ class World:
         self.interrupt = threading.Event()
         self.stop = threading.Event()
         self.load_delay = 0.3
+        self.device_type = "cuda"
         threading.Thread(target=self._worker, daemon=True).start()
 
     def log(self, what, **kw):
@@ -130,7 +131,7 @@ def make_handler(world):
                                        "queue_pending": [item(j) for j in world.queue]})
                 if path == "/system_stats":
                     return self.reply({"system": {"comfyui_version": "fake"}, "devices": [{
-                        "name": "cuda:0 Fake GPU", "type": "cuda", "vram_total": world.total * MiB,
+                        "name": "cuda:0 Fake GPU", "type": world.device_type, "vram_total": world.total * MiB,
                         "vram_free": world.free() * MiB, "torch_vram_total": 0, "torch_vram_free": 0}]})
             self.reply({}, 404)
 
