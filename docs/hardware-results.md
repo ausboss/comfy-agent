@@ -9,7 +9,7 @@ versions: [examples/pi-local/versions.json](../examples/pi-local/versions.json).
 
 | Machine | GPU | Router probe | Pilot (2 cycles) | 20 cycles | Timeout, crash, memory checks |
 |---|---|---|---|---|---|
-| arch3090 | RTX 3090 24 GB, Ampere | not run | not run | not run | not run |
+| arch3090 | RTX 3090 24 GB, Ampere | blocked: no cmake or CUDA toolkit (2026-11-27) | not run | not run | not run |
 | arch5090 | RTX 5090 32 GB, Blackwell | not run | not run | not run | not run |
 | Legion | RTX 3070 Laptop 8 GB | M2 | M2 | M2 | M2 |
 | metro-a5000 | RTX A5000 24 GB, 15 GB RAM | M2 | M2 | M2 | M2 |
@@ -48,6 +48,14 @@ timings, or real memory.
 
 ## Real runs
 
-None yet. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
+### arch3090, 2026-11-27 08:30 UTC: build blocked
+
+Linux 7.2.15-4-omarchy (Arch), RTX 3090 24576 MiB, driver 615.78.08 (CUDA 13.4 user-mode driver), gcc 16.2.1,
+Python 3.14.8. Before: 833 MiB used (idle test ComfyUI on :8199 at 256 MiB, plus the desktop), queue empty.
+`first-check.sh` stopped at the llama.cpp build: no `cmake`, no `nvcc`. Nothing loaded on the GPU; 833 MiB
+after. A user on a fresh Arch desktop needs `sudo pacman -S cmake cuda` before building, or a prebuilt
+llama-server. The script now checks for both up front and says so.
+
+None of the measured runs below exist yet. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
 recipe, kit commit, peak VRAM per side, co-residency violations, and time to unload, render, free and reload
 (from `ops --json`).
