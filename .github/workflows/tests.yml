@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: "3.9"}
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: macos-latest, python: "3.13"}
+          - {os: windows-latest, python: "3.13"}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # uv brings its own Python builds, so old versions work on new runner images too
+      - uses: astral-sh/setup-uv@v6
+      - name: Unit tests (fake ComfyUI and model servers, no GPU)
+        run: uv run --no-project --python ${{ matrix.python }} python -m unittest discover -s tests -v
