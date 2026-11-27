@@ -32,6 +32,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SUBJECTS = ["a red fox asleep in the snow", "a lighthouse on a cliff at dusk", "a bowl of ramen on a wooden table",
             "an old bicycle against a blue wall", "a heron standing in a misty pond"]
+EDITS = ["make it night time with a full moon", "make it snow", "turn it into a watercolor painting",
+         "make it golden hour", "add fog"]
 
 
 def get_json(url, timeout=5):
@@ -165,8 +167,13 @@ def run_cycle(a, i, out):
     subject = SUBJECTS[i % len(SUBJECTS)]
     mark(out, "cycle_start", cycle=i)
     pi = Pi(a, out / f"pi-{i:02d}.jsonl")
-    ask = (f"Make one picture of {subject} with my ComfyUI, using the {a.recipe} recipe. "
-           "When it is done, tell me the file path and the seed.")
+    if a.image:  # an edit recipe (e.g. qwen-edit) on the person's own picture
+        subject = EDITS[i % len(EDITS)]
+        ask = (f"Edit my picture {a.image} with my ComfyUI, using the {a.recipe} recipe: {subject}. "
+               "Make one result. When it is done, tell me the file path and the seed.")
+    else:
+        ask = (f"Make one picture of {subject} with my ComfyUI, using the {a.recipe} recipe. "
+               "When it is done, tell me the file path and the seed.")
     ev1, t1 = pi.prompt(ask, a.turn_deadline)
     mark(out, "render_turn_end", cycle=i)
     ev2, t2 = pi.prompt("What seed did that picture use? Answer with only the number.", 300)
@@ -214,6 +221,7 @@ def main():
     ap.add_argument("--model-file", default="")
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--recipe", default="zimage")
+    ap.add_argument("--image", default="", help="the person's picture, for an edit recipe such as qwen-edit")
     ap.add_argument("--workdir", default=str(Path.home()))
     ap.add_argument("--turn-deadline", type=float, default=1800)
     ap.add_argument("--notes", default="")
