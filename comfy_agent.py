@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """comfy-agent: let any AI agent make pictures and videos with ComfyUI.
 
-One file, Python 3.9 or newer, standard library only. It talks to ComfyUI over its HTTP API.
+Python 3.9 or newer, standard library only (this file and comfy_lifecycle.py). It talks to ComfyUI over its HTTP API.
 
   comfy_agent.py list                         the recipes, one line each
   comfy_agent.py show RECIPE [--notes]        a recipe's settings, defaults and tips
@@ -16,6 +16,7 @@ One file, Python 3.9 or newer, standard library only. It talks to ComfyUI over i
   comfy_agent.py gallery [--off]              the results as a private web page on your tailnet
   comfy_agent.py config [key=value ...]       url, out, and where "phone" is
   comfy_agent.py mcp [--http PORT --token T]  the same thing as an MCP server with 3 tools
+  comfy_agent.py ops [OP] [--json] | cancel [OP] | reconcile   the GPU handoff (docs/lifecycle.md)
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ import datetime as dt
 import difflib
 import hashlib
 import html
+import http.client
 import io
 import json
 import mimetypes
@@ -36,12 +38,16 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+from comfy_lifecycle import (JOB_FINAL, OP_FINAL, AdapterError, Journal, Lease, free_mb, make_adapter, new_op_id,
+                             pid_alive)
 
 KIT = Path(__file__).resolve().parent
 CONFIG = KIT / "comfy-agent.local.json"
@@ -72,6 +78,8 @@ def load_settings():
         s["out"] = os.environ["COMFY_AGENT_OUT"]
     if os.environ.get("COMFY_AGENT_UNLOAD_LLM"):
         s["unload_llm"] = os.environ["COMFY_AGENT_UNLOAD_LLM"]
+    if os.environ.get("COMFY_AGENT_INFERENCE"):
+        s["inference"] = json.loads(os.environ["COMFY_AGENT_INFERENCE"])
     return s
 
 
@@ -415,29 +423,71 @@ def run_error(status):
     return "ComfyUI reported an error with no message"
 
 
+STALE = float(os.environ.get("COMFY_AGENT_STALE", 20))   # seconds without a heartbeat = the runner died
+POLL = float(os.environ.get("COMFY_AGENT_POLL", 1))       # how often to look at ComfyUI while waiting
+_journals = {}
+_children = []
+
+
+def inference_cfg():
+    """The model-server adapter's settings. The legacy unload_llm command means the command adapter."""
+    cfg = dict(S.get("inference") or {})
+    if not cfg.get("type") and S.get("unload_llm"):
+        cfg = {"type": "command", "unload": S["unload_llm"], **cfg}
+    cfg.setdefault("type", "none")
+    return cfg
+
+
+def managed():
+    return inference_cfg()["type"] != "none"
+
+
+def journal():
+    path = out_dir() / ".comfy-agent.db"
+    j = _journals.get(str(path))
+    if j is None:
+        j = _journals[str(path)] = Journal(path)
+        import_legacy_state(j)
+    return j
+
+
 def state_file():
     return out_dir() / ".comfy-agent-jobs.json"
 
 
-def load_state():
+def import_legacy_state(j):
+    """Move the pre-journal .comfy-agent-jobs.json into the journal, once."""
+    f = state_file()
+    if not f.exists():
+        return
     try:
-        return json.loads(state_file().read_text(encoding="utf-8"))
+        old = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"pending": [], "last": []}
+        old = {}
+    pending = [dict(x, state="queued") for x in old.get("pending", []) if x.get("id")]
+    if pending:
+        j.create_op("legacy-" + new_op_id(), "inline", pending[0].get("recipe"), {}, pending)
+    if old.get("last"):
+        j.set_meta("last", old["last"])
+    with contextlib.suppress(OSError):
+        f.replace(f.with_suffix(".json.imported"))
 
 
-def save_state(state):
-    out_dir().mkdir(parents=True, exist_ok=True)
-    state_file().write_text(json.dumps(state, indent=1), encoding="utf-8")
+def load_state():
+    """What older code called the state: jobs still being collected in this process's way, and the last files."""
+    j = journal()
+    inline = {o["id"] for o in j.ops(limit=200) if o["mode"] == "inline"}
+    pending = [x for x in j.jobs(states=("planned", "submitting", "uncertain", "queued")) if x["op"] in inline]
+    return {"pending": pending, "last": j.get_meta("last", [])}
 
 
-def queue_jobs(recipe, pairs, count=1, raw_sets=()):
+def build_jobs(recipe, pairs, count=1, raw_sets=()):
+    """Validate everything and build every prompt, uploads included, before anything touches the GPU."""
     jobs_settings = plan_jobs(recipe, pairs, count)
     base = recipe.prompt()
     nodes, models = preflight(base)
     if nodes or models:
         raise Fail(not_ready_message(recipe, nodes, models))
-    unload_llm()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     uploads, jobs = {}, []
     for i, given in enumerate(jobs_settings):
@@ -463,16 +513,142 @@ def queue_jobs(recipe, pairs, count=1, raw_sets=()):
                 job["settings"][key] = value if not isinstance(value, str) or len(value) <= 120 else value[:117] + "..."
         for addr, value in raw_sets:
             put(prompt, addr, json_or_text(value))
-        try:
-            job["id"] = comfy("/prompt", {"prompt": prompt, "client_id": CLIENT_ID})["prompt_id"]
-        except ComfyError as e:
-            raise Fail("ComfyUI refused the job:\n" + explain(e.detail)) from None
+        job["prompt"] = prompt
         jobs.append(job)
-    state = load_state()
-    state["pending"] = state.get("pending", []) + jobs
-    save_state(state)
     return jobs
 
+
+# ---- submitting: the prompt id is ours, so a lost answer can be looked up instead of sent again
+
+def submit_job(j, job):
+    """POST one job. Returns queued, refused or uncertain. Raises Fail if ComfyUI isn't listening."""
+    pid = str(uuid.uuid4())
+    j.set_job(job, "submitting", id=pid)
+    body = {"prompt": job["prompt"], "client_id": CLIENT_ID, "prompt_id": pid, "extra_data": {"comfy_agent_job": pid}}
+    try:
+        with open_url(S["url"] + "/prompt", "POST", body, timeout=60) as r:
+            res = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        e.close()
+        try:
+            detail = json.loads(payload)
+        except ValueError:
+            detail = payload.decode("utf-8", "replace")[:300]
+        if e.code < 500:
+            job.pop("prompt", None)
+            j.set_job(job, "failed", error="ComfyUI refused the job:\n" + explain(detail))
+            return "refused"
+        j.set_job(job, "uncertain", error=f"HTTP {e.code} from ComfyUI while submitting")
+        return "uncertain"
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ConnectionRefusedError):
+            job.pop("id", None)
+            j.set_job(job, "planned")
+            raise Fail(f"ComfyUI is not answering at {S['url']} ({e.reason}).") from None
+        j.set_job(job, "uncertain", error=f"connection problem while submitting ({e.reason})")
+        return "uncertain"
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        j.set_job(job, "uncertain", error=f"the answer to the submit was lost ({e.__class__.__name__})")
+        return "uncertain"
+    job.pop("prompt", None)
+    job.pop("error", None)
+    j.set_job(job, "queued", id=res.get("prompt_id") or pid)
+    return "queued"
+
+
+def find_in_comfy(pid):
+    """Is our prompt id (or our marker, for servers that pick their own ids) in ComfyUI's queue or history?
+    Returns ComfyUI's prompt id, or None. Raises Fail if ComfyUI isn't answering."""
+    if (comfy(f"/history/{pid}") or {}).get(pid):
+        return pid
+    q = comfy("/queue") or {}
+    items = q.get("queue_running", []) + q.get("queue_pending", [])
+    entries = [(k, v.get("prompt")) for k, v in (comfy("/history?max_items=200") or {}).items()]
+    for real, item in [(i[1], i) for i in items] + entries:
+        extra = item[3] if isinstance(item, list) and len(item) > 3 and isinstance(item[3], dict) else {}
+        if real == pid or extra.get("comfy_agent_job") == pid:
+            return real
+    return None
+
+
+def resolve_uncertain(j, job, tries=None):
+    """Match an uncertain job against ComfyUI. Never sends it again."""
+    tries = tries or int(os.environ.get("COMFY_AGENT_RESOLVE_TRIES", 10))
+    answered = 0
+    for _ in range(tries):
+        try:
+            real = find_in_comfy(job["id"])
+        except Fail:
+            time.sleep(1)
+            continue
+        if real:
+            job.pop("prompt", None)
+            job.pop("error", None)
+            j.set_job(job, "queued", id=real)
+            return True
+        answered += 1
+        if answered >= 3:
+            break
+        time.sleep(1)
+    if answered:
+        job.pop("prompt", None)
+        j.set_job(job, "failed", error="ComfyUI may not have received this job: it is not in its queue or "
+                                       "history. It was not sent again.")
+        return False
+    return None  # ComfyUI not answering: stays uncertain
+
+
+def submit_all(j, op_id, stop=None):
+    """Submit the operation's planned jobs in order, recording each one as soon as ComfyUI accepts it.
+    A refused job stops the batch; the jobs after it are skipped. Returns the error text or None."""
+    error = None
+    for job in j.jobs(op_id):
+        if job["state"] in ("submitting", "uncertain"):
+            resolve_uncertain(j, job)
+            continue
+        if job["state"] != "planned":
+            continue
+        if error or (stop and stop()):
+            job.pop("prompt", None)
+            j.set_job(job, "skipped", error=error and "not sent: " + error or "not sent: cancelled")
+            continue
+        try:
+            result = submit_job(j, job)
+        except Fail as e:
+            error = str(e).splitlines()[0]
+            job.pop("prompt", None)
+            j.set_job(job, "skipped", error="not sent: " + error)
+            continue
+        if result == "uncertain":
+            resolve_uncertain(j, job)
+        elif result == "refused":
+            error = f"ComfyUI refused job {job['n']}/{job['of']}"
+    if error:
+        j.set_op(op_id, error=error)
+    return error
+
+
+def queue_jobs(recipe, pairs, count=1, raw_sets=()):
+    """Unmanaged mode: build, record and submit in this process. Returns the accepted jobs."""
+    jobs = build_jobs(recipe, pairs, count, raw_sets)
+    j = journal()
+    op_id = new_op_id()
+    j.create_op(op_id, "inline", recipe.name, {}, jobs)
+    submit_all(j, op_id)
+    jobs = j.jobs(op_id)
+    accepted = [x for x in jobs if x["state"] in ("queued", "uncertain", "submitting")]
+    refused = [x for x in jobs if x["state"] == "failed"]
+    if not accepted:
+        j.set_op(op_id, state="failed")
+        j.mark_delivered([x["rowid"] for x in jobs])
+        raise Fail(refused[0]["error"] if refused else (jobs[0].get("error") or "Nothing was queued."))
+    j.set_op(op_id, state="rendering")
+    report_jobs(j, [x for x in jobs if x["state"] in JOB_FINAL])
+    return accepted
+
+
+# ---- waiting and collecting
 
 def save_outputs(entry, job):
     items, seen = [], set()
@@ -498,53 +674,125 @@ def save_outputs(entry, job):
     return saved
 
 
+def live_ids():
+    q = comfy("/queue") or {}
+    return ({i[1] for i in q.get("queue_running", [])}, {i[1] for i in q.get("queue_pending", [])})
+
+
+def poll_jobs(j, left, check_lost=False):
+    """One look at ComfyUI for each job in left. Finished jobs are saved, recorded and removed from left."""
+    for job in list(left):
+        if job["state"] in ("uncertain", "submitting"):
+            if resolve_uncertain(j, job, tries=1) is not True:
+                if job["state"] == "failed":
+                    left.remove(job)
+                continue
+        entry = (comfy(f"/history/{job['id']}") or {}).get(job["id"])
+        if not entry:
+            continue
+        left.remove(job)
+        status = entry.get("status") or {}
+        if status.get("status_str") == "error":
+            kinds = [m[0] for m in status.get("messages", [])]
+            j.set_job(job, "cancelled" if "execution_interrupted" in kinds else "failed",
+                      error=run_error(status), finished=time.time())
+            continue
+        files = save_outputs(entry, job)
+        took = None
+        times = [m[1].get("timestamp") for m in status.get("messages", []) if m[0] in ("execution_start", "execution_success")]
+        if len(times) == 2 and all(times):
+            took = (times[1] - times[0]) / 1000
+        j.set_job(job, "done", files=files, took=took, finished=time.time())
+    if check_lost and left:
+        running, pending = live_ids()
+        for job in [x for x in left if x["state"] == "queued" and x["id"] not in running | pending]:
+            if not (comfy(f"/history/{job['id']}") or {}).get(job["id"]):
+                left.remove(job)
+                j.set_job(job, "lost", error="ComfyUI lost this job (was it restarted?)", finished=time.time())
+
+
+def job_line(job):
+    if job["state"] == "done":
+        seed = f", seed {job['seed']}" if "seed" in job else ""
+        took = f", {job['took']:.1f} s" if job.get("took") else ""
+        return f"done {job['n']}/{job['of']}{seed}{took}: {', '.join(job.get('files') or []) or '(no files)'}"
+    if job["state"] == "skipped":
+        return f"skipped {job['n']}/{job['of']}: {job.get('error') or 'not sent'}"
+    if job["state"] == "cancelled":
+        return f"cancelled {job['n']}/{job['of']}"
+    return f"FAILED {job['n']}/{job['of']}: {job.get('error')}"
+
+
+def report_jobs(j, jobs):
+    """Print each finished job once. Returns the ones printed now."""
+    fresh = [x for x in jobs if x["state"] in JOB_FINAL and not x.get("delivered")]
+    for job in fresh:
+        print(job_line(job), flush=True)
+        job["delivered"] = 1
+    j.mark_delivered([x["rowid"] for x in fresh])
+    return fresh
+
+
+def remember_files(j, jobs):
+    files = [f for x in jobs if x["state"] == "done" for f in x.get("files") or []]
+    if files:
+        j.set_meta("last", files)
+        try:
+            write_index()
+        except OSError as e:
+            print(f"(the gallery page wasn't updated: {e})", flush=True)
+    return files
+
+
 def wait_jobs(jobs, timeout=600):
-    """Wait for jobs, saving each one's files as it finishes. Returns the jobs still running."""
+    """Unmanaged mode: wait for jobs, saving each one's files as it finishes. Returns the jobs still running."""
+    j = journal()
     start, last_check = time.time(), time.time()
-    left = list(jobs)
+    left = [x for x in jobs if x.get("state", "queued") not in JOB_FINAL]
     while left:
-        for job in list(left):
-            entry = (comfy(f"/history/{job['id']}") or {}).get(job["id"])
-            if not entry:
-                continue
-            left.remove(job)
-            status = entry.get("status") or {}
-            if status.get("status_str") == "error":
-                job["error"] = run_error(status)
-                print(f"FAILED {job['n']}/{job['of']}: {job['error']}", flush=True)
-                continue
-            job["files"] = save_outputs(entry, job)
-            took = ""
-            times = [m[1].get("timestamp") for m in status.get("messages", []) if m[0] in ("execution_start", "execution_success")]
-            if len(times) == 2 and all(times):
-                took = f", {(times[1] - times[0]) / 1000:.1f} s"
-            seed = f", seed {job['seed']}" if "seed" in job else ""
-            print(f"done {job['n']}/{job['of']}{seed}{took}: {', '.join(job['files']) or '(no files)'}", flush=True)
+        check = time.time() - last_check > 15
+        if check:
+            last_check = time.time()
+        poll_jobs(j, left, check_lost=check)
+        report_jobs(j, jobs)
         if not left:
             break
         if time.time() - start > timeout:
             print(f"{len(left)} job(s) still running. Collect them later with: python3 comfy_agent.py wait", flush=True)
             break
-        if time.time() - last_check > 15:
-            last_check = time.time()
-            q = comfy("/queue") or {}
-            live = {item[1] for item in q.get("queue_running", []) + q.get("queue_pending", [])}
-            for job in [j for j in left if j["id"] not in live]:
-                if not (comfy(f"/history/{job['id']}") or {}).get(job["id"]):
-                    left.remove(job)
-                    job["error"] = "ComfyUI lost this job (was it restarted?)"
-                    print(f"FAILED {job['n']}/{job['of']}: {job['error']}", flush=True)
-        time.sleep(1)
-    finished_ids = {j["id"] for j in jobs if j not in left}
-    state = load_state()
-    state["pending"] = [j for j in state.get("pending", []) if j["id"] not in finished_ids]
-    files = [f for j in jobs if j not in left for f in j.get("files", [])]
-    if files:
-        state["last"] = files
-    save_state(state)
-    if files:
-        write_index()
+        time.sleep(POLL)
+    for op_id in {x["op"] for x in jobs if x.get("op")}:
+        if not j.jobs(op_id, states=("planned", "submitting", "uncertain", "queued")):
+            j.set_op(op_id, state="done")
+    remember_files(j, [x for x in jobs if x not in left])
     return left
+
+
+def cancel_jobs(j, jobs, timeout=60):
+    """Take our jobs out of ComfyUI: delete the waiting ones, interrupt the running one, and confirm
+    in the queue that none is left. Jobs not sent yet are skipped."""
+    for job in [x for x in jobs if x["state"] == "planned"]:
+        job.pop("prompt", None)
+        j.set_job(job, "skipped", error="not sent: cancelled")
+    mine = [x for x in jobs if x["state"] in ("queued", "uncertain", "submitting") and x.get("id")]
+    ids = {x["id"] for x in mine}
+    start = time.time()
+    while ids and time.time() - start < timeout:
+        running, pending = live_ids()
+        if not ids & (running | pending):
+            break
+        if ids & pending:
+            comfy("/queue", {"delete": sorted(ids & pending)})
+        for pid in ids & running:
+            comfy("/interrupt", {"prompt_id": pid})
+        time.sleep(min(POLL, 0.5))
+    else:
+        if ids:
+            raise Fail("ComfyUI still lists the cancelled jobs after a minute.")
+    left = list(mine)
+    poll_jobs(j, left)  # a job that finished in the meantime keeps its files
+    for job in left:
+        j.set_job(job, "cancelled", finished=time.time())
 
 
 def free_vram():
@@ -552,51 +800,489 @@ def free_vram():
     print("Asked ComfyUI to unload its models and free the GPU.")
 
 
-def unload_llm():
-    """Small-card mode: take the agent's own model off the GPU while ComfyUI works.
+# ---------------------------------------------------------------- managed mode: the runner
 
-    The model server loads it back by itself on the agent's next request (llama-swap, LM Studio, Ollama)."""
-    cmd = S.get("unload_llm")
-    if not cmd:
-        return
+class Blocked(Exception):
+    """The model stays unloaded; the next operation or reconcile restores it."""
+
+
+def comfy_free_mb():
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise Fail(f"Unloading the language model took over 2 minutes: {cmd}") from None
-    if r.returncode:
-        raise Fail(f"Unloading the language model failed ({cmd}): {(r.stderr or r.stdout).strip()[:300]}")
-    print("Unloaded the language model so ComfyUI has the whole card. It loads back on your next turn.", flush=True)
+        return free_mb(comfy("/system_stats", timeout=10), inference_cfg().get("device", 0))
+    except (Fail, ComfyError):
+        return None
+
+
+def comfy_busy():
+    running, pending = live_ids()
+    return bool(running or pending)
+
+
+class Runner:
+    """Owns one managed operation from the lease to the restore. Runs detached (comfy_agent.py _runner)."""
+
+    def __init__(self, op_id):
+        self.j = journal()
+        self.id = op_id
+        self.op = self.j.op(op_id)
+        self.data = self.op["data"]
+        self.cfg = self.data.get("inference") or inference_cfg()
+        self.adapter = make_adapter(self.cfg)
+        self.lease = Lease(out_dir())
+        self._stop = threading.Event()
+
+    def event(self, text):
+        print(text, flush=True)
+        self.j.append(self.id, "events", [time.time(), text])
+
+    def state(self, state, **kw):
+        self.j.set_op(self.id, state=state, **kw)
+
+    def cancelled(self):
+        return bool(self.j.op(self.id)["cancel"])
+
+    def timed(self, phase, start):
+        self.j.set_op(self.id, data={"phases": {**self.j.op(self.id)["data"].get("phases", {}),
+                                                phase: round(time.time() - start, 2)}})
+
+    def vram(self, key):
+        mb = comfy_free_mb()
+        self.j.set_op(self.id, data={"vram_mb": {**self.j.op(self.id)["data"].get("vram_mb", {}), key: mb}})
+        return mb
+
+    def names(self, models):
+        if self.adapter.kind == "command" and not self.cfg.get("model"):
+            return ""
+        return f" ({', '.join(models)})"
+
+    def beat(self):
+        while not self._stop.wait(1):
+            with contextlib.suppress(Exception):
+                self.j.heartbeat(self.id)
+
+    def run(self):
+        self.j.heartbeat(self.id, os.getpid())
+        threading.Thread(target=self.beat, daemon=True).start()
+        held = False
+        try:
+            t = time.time()
+            held = self.lease.acquire(self.id, poll=0.2, should_stop=self.cancelled,
+                                      on_wait=lambda h: self.event(
+                                          f"waiting for the GPU: operation {(h or {}).get('op', '(unknown)')} has it"))
+            self.op = self.j.op(self.id)
+            if self.op["state"] in ("done", "failed", "cancelled"):
+                return
+            if not held:
+                cancel_jobs(self.j, self.j.jobs(self.id))
+                self.state("cancelled")
+                self.event("cancelled before it started")
+                return
+            self.timed("lease", t)
+            if not self.op["data"].get("unloaded"):
+                if self.cancelled():
+                    cancel_jobs(self.j, self.j.jobs(self.id))
+                    self.state("cancelled")
+                    self.event("cancelled before it started")
+                    return
+                self.unload()
+            self.state("submitting")
+            submit_all(self.j, self.id, stop=self.cancelled)
+            self.state("rendering")
+            self.render()
+            self.hand_back()
+        except Blocked as e:
+            self.state("blocked", error=str(e))
+            self.event(f"BLOCKED: {e} The language model stays unloaded. When that's fixed: "
+                       "python3 comfy_agent.py reconcile")
+        except Exception as e:  # anything else: leave a clear record
+            msg = str(e).splitlines()[0] if str(e) else e.__class__.__name__
+            if self.j.op(self.id)["data"].get("unloaded"):
+                self.state("blocked", error=msg)
+                self.event(f"BLOCKED: {msg} The language model stays unloaded. When that's fixed: "
+                           "python3 comfy_agent.py reconcile")
+            else:
+                for job in self.j.jobs(self.id, states=("planned",)):
+                    job.pop("prompt", None)
+                    self.j.set_job(job, "skipped", error="not sent: " + msg)
+                self.state("failed", error=msg)
+                self.event(f"FAILED: {msg}")
+        finally:
+            if held:
+                self.lease.release()
+            self._stop.set()
+
+    def unload(self):
+        t = time.time()
+        self.state("unloading")
+        before = self.vram("before_unload")
+        models = self.adapter.loaded()
+        if models:
+            self.adapter.unload(models)
+            limit = time.time() + float(self.cfg.get("unload_timeout", 120))
+            while self.adapter.is_unloaded(models) is False:
+                if time.time() > limit:
+                    raise AdapterError(f"the language model ({', '.join(models)}) didn't leave the GPU")
+                time.sleep(0.25)
+        after = self.vram("after_unload")
+        freed = after - before if models and before is not None and after is not None and after > before else None
+        self.j.set_op(self.id, data={"unloaded": True, "models": models, "freed_mb": freed,
+                                     "adapter": self.adapter.kind})
+        self.timed("unload", t)
+        if models:
+            self.event(f"unloaded the language model{self.names(models)}" +
+                       (f", {freed / 1024:.1f} GB freed" if freed else ""))
+
+    def render(self):
+        t = time.time()
+        left = self.j.jobs(self.id, states=("queued", "uncertain", "submitting"))
+        last_check, down_since = time.time(), None
+        while left:
+            if self.cancelled():
+                cancel_jobs(self.j, left)
+                break
+            try:
+                check = time.time() - last_check > 15
+                if check:
+                    last_check = time.time()
+                poll_jobs(self.j, left, check_lost=check)
+                down_since = None
+            except Fail:
+                down_since = down_since or time.time()
+                if time.time() - down_since > float(self.cfg.get("down_timeout", 120)):
+                    raise Blocked("ComfyUI stopped answering during the render.") from None
+            if left:
+                time.sleep(POLL)
+        jobs = self.j.jobs(self.id)
+        files = remember_files(self.j, jobs)
+        send = self.j.op(self.id)["data"].get("send")
+        if files and send:
+            try:
+                self.event(send_files(files, send))
+            except Exception as e:  # delivery never fails the render
+                self.event(f"Sending failed (the files are saved): {e}")
+                self.j.append(self.id, "notes", f"send failed: {e}")
+        self.timed("render", t)
+
+    def hand_back(self):
+        data = self.j.op(self.id)["data"]
+        models = list(data.get("models") or [])
+        need = data.get("freed_mb") or 0
+        inherited = [o for o in self.j.blocked_ops() if o["id"] != self.id]
+        for o in inherited:
+            models += [m for m in o["data"].get("models") or [] if m not in models]
+            need += o["data"].get("freed_mb") or 0
+        need = int(self.cfg["need_mb"]) if self.cfg.get("need_mb") else need
+        while True:
+            t = time.time()
+            self.state("idle-wait")
+            limit = time.time() + float(self.cfg.get("idle_timeout", 3600))
+            told = False
+            while comfy_busy():
+                if not told:
+                    self.event("waiting for ComfyUI's queue to empty before the language model comes back")
+                    told = True
+                if time.time() > limit:
+                    raise Blocked("ComfyUI is still busy with other jobs.")
+                time.sleep(POLL)
+            self.timed("idle", t)
+            t = time.time()
+            self.state("freeing")
+            free_vram()
+            if models and need:
+                want = need + int(self.cfg.get("margin_mb", 512))
+                limit = time.time() + float(self.cfg.get("free_timeout", 180))
+                while True:
+                    have = comfy_free_mb()
+                    if have is None or have >= want:
+                        break
+                    if time.time() > limit:
+                        self.vram("after_free")
+                        raise Blocked(f"memory not released ({have / 1024:.1f} GB free, need {want / 1024:.1f} GB).")
+                    time.sleep(0.5)
+            self.vram("after_free")
+            self.timed("free", t)
+            if not comfy_busy():  # nothing slipped in while memory was being freed
+                break
+        if not models:
+            self.state("cancelled" if self.cancelled() else "done")
+            return
+        t = time.time()
+        self.state("restoring")
+        try:
+            self.adapter.load(models)
+            limit = time.time() + float(self.cfg.get("load_timeout", 300))
+            while not self.adapter.is_ready(models):
+                if time.time() > limit:
+                    raise AdapterError("it didn't report ready in time")
+                time.sleep(0.5)
+        except AdapterError as e:
+            raise Blocked(f"the language model didn't load back ({e}).") from None
+        self.timed("restore", t)
+        for o in inherited:
+            self.j.set_op(o["id"], state="done", data={"restored_by": self.id})
+        self.state("cancelled" if self.cancelled() else "done")
+        if self.adapter.kind == "command" and not self.cfg.get("load"):
+            self.event("the language model loads back on the next request")
+        else:
+            self.event(f"restored the language model{self.names(models)}")
+
+
+def spawn_runner(op_id):
+    logs = out_dir() / ".runs"
+    logs.mkdir(parents=True, exist_ok=True)
+    kw = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT, "cwd": str(KIT)}
+    if os.name == "nt":
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    with open(logs / f"{op_id}.log", "ab") as log:
+        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_runner", "--out", str(out_dir()), op_id],
+                             stdout=log, **kw)
+    _children.append(p)
+    journal().set_op(op_id, pid=p.pid, heartbeat=time.time())
+    return p
+
+
+def reap():
+    for p in list(_children):
+        if p.poll() is not None:
+            _children.remove(p)
+
+
+def runner_dead(op):
+    stale = time.time() - (op["heartbeat"] or 0) > STALE
+    return stale or (op["pid"] and not pid_alive(op["pid"]))
+
+
+def reconcile(include_blocked=False, only=None, quiet=True):
+    """Start a new runner for every unfinished managed operation whose runner died. With include_blocked,
+    also retry the blocked ones (they wait for memory or ComfyUI). Returns the operations restarted."""
+    reap()
+    j = journal()
+    todo = [o for o in j.ops(limit=50, unfinished=True) if o["mode"] == "managed" and runner_dead(o)]
+    if include_blocked:
+        todo += j.blocked_ops()
+    started = []
+    for op in todo:
+        if only and op["id"] not in only:
+            continue
+        if not j.claim(op["id"], op["heartbeat"]):
+            continue
+        spawn_runner(op["id"])
+        started.append(op["id"])
+        if not quiet:
+            print(f"restarted the runner for operation {op['id']} ({op['state']})", flush=True)
+    return started
+
+
+def start_managed(recipe, pairs, count=1, raw_sets=(), send=None):
+    jobs = build_jobs(recipe, pairs, count, raw_sets)
+    op_id = new_op_id()
+    data = {"settings": {"url": S["url"], "out": S["out"], "send": S.get("send", {})},
+            "inference": inference_cfg(), "send": send, "events": [], "phases": {}, "vram_mb": {}}
+    j = journal()
+    j.create_op(op_id, "managed", recipe.name, data, jobs)
+    j.set_op(op_id, heartbeat=time.time())
+    print(f"queued {len(jobs)} job(s) of {recipe.name} as operation {op_id}", flush=True)
+    spawn_runner(op_id)
+    return op_id
+
+
+def follow(op_ids, timeout, stop=None, progress=None, all_events=True):
+    """Print an operation's lines and finished jobs as they happen, until it ends or timeout.
+    Returns (operations, jobs reported now)."""
+    j = journal()
+    start = time.time()
+    seen = {i: 0 if all_events else len((j.op(i) or {"data": {}})["data"].get("events", [])) for i in op_ids}
+    reported, last_reconcile, last_progress, pings = [], time.time(), time.time(), 0
+    while True:
+        ops = [j.op(i) for i in op_ids]
+        lines = []
+        for op in ops:
+            ev = op["data"].get("events", [])
+            lines += [(t, text, None) for t, text in ev[seen[op["id"]]:]]
+            seen[op["id"]] = len(ev)
+        jobs = [x for i in op_ids for x in j.jobs(i)]
+        fresh = [x for x in jobs if x["state"] in JOB_FINAL and not x.get("delivered")]
+        lines += [(x.get("finished") or time.time(), None, x) for x in fresh]
+        for _, text, job in sorted(lines, key=lambda l: l[0]):
+            print(text if job is None else job_line(job), flush=True)
+        j.mark_delivered([x["rowid"] for x in fresh])
+        reported += fresh
+        if all(o["state"] in OP_FINAL for o in ops):
+            break
+        if (stop and stop()) or time.time() - start > timeout:
+            for o in ops:
+                if o["state"] not in OP_FINAL:
+                    js = j.jobs(o["id"])
+                    done = sum(x["state"] in JOB_FINAL for x in js)
+                    print(f"still rendering: operation {o['id']}, {done} of {len(js)} done. "
+                          "Collect with: python3 comfy_agent.py wait", flush=True)
+            break
+        if time.time() - last_reconcile > 5:
+            last_reconcile = time.time()
+            reconcile(only=op_ids)
+        if progress and time.time() - last_progress > float(os.environ.get("COMFY_AGENT_PROGRESS_EVERY", 10)):
+            last_progress = time.time()
+            pings += 1
+            done = sum(x["state"] in JOB_FINAL for x in jobs)
+            progress(pings, f"{done} of {len(jobs)} done, {ops[0]['state']}")
+        time.sleep(0.3)
+    return ops, reported
+
+
+def undelivered_ops(mode="managed"):
+    j = journal()
+    ids = [o["id"] for o in j.ops(limit=50, unfinished=True) if o["mode"] == mode]
+    for x in j.jobs(undelivered=True):
+        if x["op"] not in ids and (j.op(x["op"]) or {}).get("mode") == mode:
+            ids.append(x["op"])
+    return ids
 
 
 def cmd_run(a):
     recipe = get_recipe(a.recipe)
-    jobs = queue_jobs(recipe, parse_pairs(a.values), max(1, a.count), parse_pairs(a.set or []))
+    pairs, sets = parse_pairs(a.values), parse_pairs(a.set or [])
+    if managed():
+        reconcile()
+        op_id = start_managed(recipe, pairs, max(1, a.count), sets, send=a.send)
+        if a.no_wait and inference_cfg()["type"] == "llama-router":
+            print("The runner finishes it and brings the language model back. Collect with: python3 comfy_agent.py wait")
+            return
+        if a.no_wait:
+            print("Waiting anyway: the language model is unloaded, and it must not load back until these are done.")
+        ops, _ = follow([op_id], a.timeout)
+        end_status(ops)
+        return
+    jobs = queue_jobs(recipe, pairs, max(1, a.count), sets)
     print(f"queued {len(jobs)} job(s) of {recipe.name}", flush=True)
-    if a.no_wait and S.get("unload_llm"):
-        print("Waiting anyway: the language model is unloaded, and it must not load back until these are done.")
-    elif a.no_wait:
+    if a.no_wait:
         print("Collect the results with: python3 comfy_agent.py wait")
         return
     left = wait_jobs(jobs, a.timeout)
     finish(jobs, left, a)
+    err = journal().op(jobs[0]["op"])["error"]
+    if err:
+        raise Fail(err)
+
+
+def end_status(ops):
+    bad = [o for o in ops if o["state"] in ("failed", "blocked") or (o["state"] == "done" and o["error"])]
+    if bad:
+        raise Fail("")
 
 
 def cmd_wait(a):
+    if managed():
+        reconcile()
+    ids = undelivered_ops("managed")
     pending = load_state().get("pending", [])
-    if not pending:
+    j = journal()
+    old = [x for x in j.jobs(undelivered=True) if x["state"] in JOB_FINAL and x["op"] not in ids]
+    if not ids and not pending and not old:
         print("No jobs are waiting.")
         return
-    print(f"waiting for {len(pending)} job(s)", flush=True)
-    left = wait_jobs(pending, a.timeout)
-    finish(pending, left, a)
+    report_jobs(j, old)
+    files = []
+    if ids:
+        ops, done = follow(ids, a.timeout)
+        files = [f for x in done if x["state"] == "done" for f in x.get("files") or []]
+    if pending:
+        print(f"waiting for {len(pending)} job(s)", flush=True)
+        left = wait_jobs(pending, a.timeout)
+        finish(pending, left, a)
+    elif files and a.send:
+        try:
+            print(send_files(files, a.send))
+        except Fail as e:
+            print(f"Sending failed (the files are saved): {e}")
 
 
 def finish(jobs, left, a):
-    files = [f for j in jobs if j not in left for f in j.get("files", [])]
+    files = [f for x in jobs if x not in left for f in x.get("files") or []]
     if files and a.send:
-        print(send_files(files, a.send))
-    if (a.free or S.get("unload_llm")) and not left:
+        try:
+            print(send_files(files, a.send))
+        except Fail as e:
+            print(f"Sending failed (the files are saved): {e}")
+    if a.free and not left:
         free_vram()
+
+
+def cmd_ops(a):
+    j = journal()
+    reconcile()
+    ops = [j.op(a.op)] if a.op else j.ops(limit=a.limit)
+    if a.op and not ops[0]:
+        raise Fail(f"No operation {a.op}.")
+    if a.json:
+        out = []
+        for o in ops:
+            d = o["data"]
+            out.append({"id": o["id"], "state": o["state"], "mode": o["mode"], "recipe": o["recipe"],
+                        "error": o["error"], "created": o["created"], "adapter": d.get("adapter"),
+                        "models": d.get("models"), "phases": d.get("phases", {}), "vram_mb": d.get("vram_mb", {}),
+                        "notes": d.get("notes", []), "events": [e[1] for e in d.get("events", [])],
+                        "jobs": [{k: x.get(k) for k in ("n", "state", "id", "seed", "files", "error", "took")}
+                                 for x in j.jobs(o["id"])]})
+        for item in out:
+            for job in item["jobs"]:
+                job["prompt_id"] = job.pop("id")
+        print(json.dumps(out if not a.op else out[0], indent=1))
+        return
+    if not ops:
+        print("No operations yet.")
+    for o in ops:
+        js = j.jobs(o["id"])
+        done = sum(x["state"] == "done" for x in js)
+        err = f": {o['error']}" if o["error"] else ""
+        print(f"{o['id']} {o['state']} {o['recipe']} {done}/{len(js)} done{err}")
+
+
+def cmd_cancel(a):
+    j = journal()
+    ops = [j.op(a.op)] if a.op else j.ops(limit=50, unfinished=True)
+    if a.op and not ops[0]:
+        raise Fail(f"No operation {a.op}.")
+    if not ops:
+        print("Nothing to cancel.")
+        return
+    for o in ops:
+        if o["state"] in OP_FINAL:
+            print(f"operation {o['id']} already ended ({o['state']})")
+            continue
+        j.set_op(o["id"], cancel=1)
+        if o["mode"] == "managed":
+            print(f"cancelling operation {o['id']}", flush=True)
+        else:
+            cancel_jobs(j, j.jobs(o["id"]))
+            j.set_op(o["id"], state="cancelled")
+            print(f"cancelled operation {o['id']}", flush=True)
+    if managed():
+        reconcile()
+
+
+def cmd_reconcile(a):
+    started = reconcile(include_blocked=True, quiet=False)
+    if not started:
+        print("Nothing to reconcile: no unfinished or blocked operations.")
+        return
+    if a.no_wait:
+        return
+    ops, _ = follow(started, a.timeout, all_events=False)
+    end_status(ops)
+
+
+def cmd__runner(a):
+    S["out"] = a.out
+    op = journal().op(a.op)
+    if not op:
+        raise Fail(f"No operation {a.op}.")
+    snap = op["data"].get("settings") or {}
+    S.update({k: v for k, v in snap.items() if v is not None})
+    S["inference"] = op["data"].get("inference") or {}
+    S.pop("unload_llm", None)
+    Runner(a.op).run()
 
 
 # ---------------------------------------------------------------- send and gallery
@@ -813,12 +1499,36 @@ def cmd_doctor(a):
     pending = load_state().get("pending", [])
     if pending:
         print(f"{len(pending)} queued job(s) not collected yet: python3 comfy_agent.py wait")
+    cfg = inference_cfg()
+    if cfg["type"] == "none":
+        print("Local model handoff: off (no inference configured).")
+        return
+    reconcile()
+    print("Local model: " + make_adapter(cfg).describe())
+    holder = Lease(out_dir()).holder() if Lease(out_dir()).held_by_anyone() else None
+    print("GPU lease: " + (f"held by operation {holder.get('op')}" if holder else "free"))
+    j = journal()
+    for o in j.ops(limit=50, unfinished=True) + j.blocked_ops():
+        print(f"  operation {o['id']}: {o['state']}" + (f" ({o['error']})" if o["error"] else ""))
+    if j.blocked_ops():
+        print("Blocked operations leave the language model unloaded. Fix the cause, then: python3 comfy_agent.py reconcile")
 
 
 def cmd_config(a):
     cfg = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.exists() else {}
     for k, v in parse_pairs(a.values):
-        if k in ("url", "out", "gallery_path", "gallery_port", "unload_llm"):
+        if k.startswith("inference."):
+            sub = k.split(".", 1)[1]
+            inf = cfg.setdefault("inference", {})
+            if v == "":
+                inf.pop(sub, None)
+            else:
+                inf[sub] = json_or_text(v) if sub not in ("model", "api_key", "unload", "load", "ready") else v
+            if sub == "type":
+                from comfy_lifecycle import ADAPTERS
+                if v and v not in ADAPTERS:
+                    raise Fail(f"inference.type must be one of {', '.join(ADAPTERS)}")
+        elif k in ("url", "out", "gallery_path", "gallery_port", "unload_llm", "mcp_wait"):
             cfg[k] = v
         else:
             cfg.setdefault("send", {})[k] = v
@@ -1195,15 +1905,49 @@ MCP_TOOLS = [
          "count": {"type": "integer", "minimum": 1, "maximum": 16},
          "send": {"type": "string", "description": "optional: 'phone' (or another target from config) to also send them there"}}}},
     {"name": "results",
-     "description": "Collect jobs that were still running when generate returned.",
-     "inputSchema": {"type": "object", "properties": {}}},
+     "description": "Collect jobs that were still running when generate returned. Each file is returned once.",
+     "inputSchema": {"type": "object", "properties": {
+         "operation": {"type": "string", "description": "optional: only this operation id"},
+         "cancel": {"type": "boolean", "description": "cancel it (or every unfinished one) instead"}}}},
 ]
 
 
-def mcp_call(name, args, previews=True):
+class _ThreadOut(io.TextIOBase):
+    """sys.stdout for the MCP server: each tool call's prints go to its own buffer, so calls can run in
+    parallel threads; everything else goes to the real stdout."""
+
+    def __init__(self, real):
+        self.real = real
+        self.local = threading.local()
+
+    def write(self, s):
+        return (getattr(self.local, "buf", None) or self.real).write(s)
+
+    def flush(self):
+        (getattr(self.local, "buf", None) or self.real).flush()
+
+
+@contextlib.contextmanager
+def capture():
     buf = io.StringIO()
+    if isinstance(sys.stdout, _ThreadOut):
+        sys.stdout.local.buf = buf
+        try:
+            yield buf
+        finally:
+            sys.stdout.local.buf = None
+    else:
+        with contextlib.redirect_stdout(buf):
+            yield buf
+
+
+def mcp_wait(default):
+    return int(os.environ.get("COMFY_AGENT_MCP_WAIT") or S.get("mcp_wait") or default)
+
+
+def mcp_call(name, args, previews=True, stop=None, progress=None):
     done = []
-    with contextlib.redirect_stdout(buf):
+    with capture() as buf:
         if name == "recipes":
             if args.get("name"):
                 cmd_show(argparse.Namespace(recipe=args["name"], notes=False))
@@ -1214,32 +1958,32 @@ def mcp_call(name, args, previews=True):
             pairs = []
             for k, v in (args.get("settings") or {}).items():
                 pairs += [(k, x) for x in v] if isinstance(v, list) else [(k, v)]
-            jobs = queue_jobs(r, pairs, max(1, min(16, int(args.get("count") or 1))))
-            print(f"queued {len(jobs)} job(s) of {r.name}")
-            wait = "1800" if S.get("unload_llm") else "240"
-            left = wait_jobs(jobs, int(os.environ.get("COMFY_AGENT_MCP_WAIT", wait)))
-            done = [j for j in jobs if j not in left]
-            files = [f for j in done for f in j.get("files", [])]
-            if files and args.get("send"):
-                print(send_files(files, args["send"]))
-            if S.get("unload_llm") and not left:
-                free_vram()
-        elif name == "results":
-            pending = load_state().get("pending", [])
-            if not pending:
-                print("No jobs are waiting.")
+            count = max(1, min(16, int(args.get("count") or 1)))
+            if managed():
+                # Follow through the restore: a client whose model is unloaded can't read an early answer.
+                reconcile()
+                op_id = start_managed(r, pairs, count, send=args.get("send"))
+                _, done = follow([op_id], mcp_wait(10800), stop=stop, progress=progress)
             else:
-                left = wait_jobs(pending, 60)
-                done = [j for j in pending if j not in left]
-                if S.get("unload_llm") and not left:
-                    free_vram()
+                jobs = queue_jobs(r, pairs, count)
+                print(f"queued {len(jobs)} job(s) of {r.name}")
+                left = wait_jobs(jobs, mcp_wait(240))
+                done = [j for j in jobs if j not in left]
+                files = [f for j in done for f in j.get("files") or []]
+                if files and args.get("send"):
+                    try:
+                        print(send_files(files, args["send"]))
+                    except Fail as e:
+                        print(f"Sending failed (the files are saved): {e}")
+        elif name == "results":
+            done = mcp_results(args, stop, progress)
         else:
             raise Fail(f"unknown tool {name}")
     content = [{"type": "text", "text": buf.getvalue().strip()}]
     if previews:
         shown = 0
         for job in done:
-            for it in job.get("remote", []):
+            for it in job.get("remote") or []:
                 if shown >= 4 or Path(it["filename"]).suffix.lower() not in IMAGE_EXT:
                     continue
                 q = urllib.parse.urlencode({"filename": it["filename"], "subfolder": it.get("subfolder", ""),
@@ -1250,21 +1994,54 @@ def mcp_call(name, args, previews=True):
     return content
 
 
-def mcp_handle(msg):
+def mcp_results(args, stop=None, progress=None):
+    j = journal()
+    if managed():
+        reconcile()
+    op = args.get("operation")
+    if op and not j.op(op):
+        raise Fail(f"No operation {op}.")
+    if args.get("cancel"):
+        cmd_cancel(argparse.Namespace(op=op))
+    ids = [op] if op else undelivered_ops("managed")
+    ids = [i for i in ids if j.op(i)["mode"] == "managed"]
+    pending = [] if op else load_state().get("pending", [])
+    old = [x for x in j.jobs(op, undelivered=True) if x["state"] in JOB_FINAL and x["op"] not in ids]
+    if not ids and not pending and not old:
+        print("No jobs are waiting.")
+        return []
+    done = report_jobs(j, old)
+    wait = int(os.environ.get("COMFY_AGENT_MCP_RESULTS_WAIT", 60))
+    if ids:
+        _, got = follow(ids, wait if not managed() else mcp_wait(10800), stop=stop, progress=progress)
+        done += got
+    if pending:
+        left = wait_jobs(pending, wait)
+        done += [x for x in pending if x not in left]
+    return [x for x in done if x["state"] == "done"]
+
+
+def mcp_handle(msg, stop=None, notify=None):
     method, mid = msg.get("method"), msg.get("id")
     if mid is None:
         return None
     if method == "initialize":
         result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
                   "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "comfy-agent", "version": "1.0"}}
+                  "serverInfo": {"name": "comfy-agent", "version": "1.1"}}
     elif method == "tools/list":
         result = {"tools": MCP_TOOLS}
     elif method == "tools/call":
         p = msg.get("params") or {}
+        token = (p.get("_meta") or {}).get("progressToken")
+        progress = None
+        if token is not None and notify:
+            def progress(n, text):
+                notify({"jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": {"progressToken": token, "progress": n, "message": text}})
         try:
-            result = {"content": mcp_call(p.get("name"), p.get("arguments") or {})}
-        except (Fail, ComfyError) as e:
+            result = {"content": mcp_call(p.get("name"), p.get("arguments") or {}, stop=stop, progress=progress)}
+        except (Fail, ComfyError, AdapterError) as e:
             result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
     elif method == "ping":
         result = {}
@@ -1273,16 +2050,61 @@ def mcp_handle(msg):
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
+def mcp_stdio(stdin, real_out):
+    """Answer requests in parallel threads, so a long generate never blocks results or a ping, and stop
+    following an operation when the client sends notifications/cancelled. The operation itself goes on."""
+    lock = threading.Lock()
+    cancels = {}
+
+    def send(obj):
+        with lock:
+            real_out.write(json.dumps(obj) + "\n")
+            real_out.flush()
+
+    def work(msg, ev):
+        try:
+            reply = mcp_handle(msg, stop=ev.is_set, notify=send)
+        except Exception as e:  # never kill the server over one call
+            reply = {"jsonrpc": "2.0", "id": msg.get("id"),
+                     "result": {"content": [{"type": "text", "text": f"{e.__class__.__name__}: {e}"}], "isError": True}}
+        cancels.pop(msg.get("id"), None)
+        if reply is not None and not ev.is_set():
+            send(reply)
+
+    threads = []
+    for line in stdin:
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("method") == "notifications/cancelled":
+            ev = cancels.get((msg.get("params") or {}).get("requestId"))
+            if ev:
+                ev.set()
+            continue
+        if msg.get("method") == "tools/call" and msg.get("id") is not None:
+            ev = cancels[msg["id"]] = threading.Event()
+            t = threading.Thread(target=work, args=(msg, ev), daemon=True)
+            t.start()
+            threads.append(t)
+            continue
+        reply = mcp_handle(msg)
+        if reply is not None:
+            send(reply)
+    for t in threads:
+        t.join(timeout=1)
+
+
 def cmd_mcp(a):
+    real = sys.stdout
+    sys.stdout = _ThreadOut(real)
+    with contextlib.suppress(Exception):
+        if managed():
+            reconcile()
     if not a.http:
-        out = sys.stdout
-        for line in sys.stdin:
-            if not line.strip():
-                continue
-            reply = mcp_handle(json.loads(line))
-            if reply is not None:
-                out.write(json.dumps(reply) + "\n")
-                out.flush()
+        mcp_stdio(sys.stdin, real)
         return
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     token = a.token or os.environ.get("COMFY_AGENT_TOKEN")
@@ -1364,6 +2186,18 @@ def main(argv=None):
     p.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("config", help="show or change settings")
     p.add_argument("values", nargs="*", help="url=..., out=..., unload_llm=COMMAND, phone=tailscale:DEVICE or phone=ntfy:TOPIC")
+    p = sub.add_parser("ops", help="recent operations, their state and timings")
+    p.add_argument("op", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("cancel", help="cancel an operation (default: every unfinished one)")
+    p.add_argument("op", nargs="?")
+    p = sub.add_parser("reconcile", help="finish operations whose runner died, retry blocked ones")
+    p.add_argument("--no-wait", action="store_true")
+    p.add_argument("--timeout", type=int, default=600)
+    p = sub.add_parser("_runner", help=argparse.SUPPRESS)
+    p.add_argument("op")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("mcp", help="run as an MCP server")
     p.add_argument("--http", type=int, help="serve Streamable HTTP on this port instead of stdio")
     p.add_argument("--token", help="secret for the HTTP server")
@@ -1371,7 +2205,8 @@ def main(argv=None):
     try:
         globals()["cmd_" + a.cmd](a)
     except Fail as e:
-        print(str(e), file=sys.stderr)
+        if str(e):
+            print(str(e), file=sys.stderr)
         return 1
     except ComfyError as e:
         print("ComfyUI said: " + explain(e.detail), file=sys.stderr)
