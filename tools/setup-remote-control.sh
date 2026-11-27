@@ -29,6 +29,7 @@
 set -uo pipefail
 
 DIR="$HOME/code/ausboss"
+DIR_GIVEN=0
 WANT_NAME=""
 NO_RENAME=0
 DRY=0
@@ -50,8 +51,8 @@ AUTH_OVERRIDES=(ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dir) DIR="$2"; shift 2 ;;
-    --dir=*) DIR="${1#*=}"; shift ;;
+    --dir) DIR="$2"; DIR_GIVEN=1; shift 2 ;;
+    --dir=*) DIR="${1#*=}"; DIR_GIVEN=1; shift ;;
     --name) WANT_NAME="$2"; shift 2 ;;
     --name=*) WANT_NAME="${1#*=}"; shift ;;
     --no-rename) NO_RENAME=1; shift ;;
@@ -107,7 +108,12 @@ CLAUDE="$(find_claude)" || { fail "claude is not installed or not on PATH"; exit
 ok "claude: $CLAUDE ($("$CLAUDE" --version 2>/dev/null | head -1))"
 command -v python3 >/dev/null || { fail "python3 is needed to edit settings files"; exit 1; }
 command -v systemctl >/dev/null || { fail "systemd is needed for the background service"; exit 1; }
-[ -d "$DIR" ] || { fail "folder $DIR does not exist (use --dir)"; exit 1; }
+if [ ! -d "$DIR" ]; then
+  if [ "$DIR_GIVEN" = 0 ] && [ "$DRY" = 0 ] && mkdir -p "$DIR"; then
+    DIR="$(cd "$DIR" && pwd -P)"; did "created $DIR (empty; sessions start here and can work anywhere you allow)"
+  elif [ "$DIR_GIVEN" = 0 ] && [ "$DRY" = 1 ]; then echo "  would create $DIR"
+  else fail "folder $DIR does not exist"; exit 1; fi
+fi
 ok "folder: $DIR"
 
 GPU="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//')"
@@ -326,7 +332,10 @@ for pid in $(pgrep -u "$(id -u)" -f 'claude( .*)? (remote-control|rc)( |$)' 2>/d
 done
 
 # The session's commands (nvidia-smi, git, python, ssh...) need your normal PATH.
-SERVICE_PATH="$(printf '%s' "$(dirname "$CLAUDE"):$PATH" | awk -v RS=: -v ORS=: '!seen[$0]++' | sed 's/:$//; s/%/%%/g')"
+# A mise/asdf shim needs its manager on PATH too.
+EXTRA_PATH="$(dirname "$CLAUDE")"
+for m in mise asdf; do command -v "$m" >/dev/null && EXTRA_PATH="$EXTRA_PATH:$(dirname "$(command -v "$m")")"; done
+SERVICE_PATH="$(printf '%s' "$EXTRA_PATH:$PATH" | awk -v RS=: -v ORS=: '!seen[$0]++' | sed 's/:$//; s/%/%%/g')"
 UNIT_TEXT="[Unit]
 Description=Claude Code Remote Control for $DIR
 Documentation=https://code.claude.com/docs/en/remote-control
