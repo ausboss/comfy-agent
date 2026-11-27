@@ -1,0 +1,11 @@
+{
+ "mcpServers": {
+  "comfy": {
+   "command": "python3",
+   "args": ["~/code/ausboss/comfy-agent/comfy_agent.py", "mcp"],
+   "exposure": "direct",
+   "timeout": 120,
+   "description": "Make pictures and videos with this computer's ComfyUI"
+  }
+ }
+}

@@ -1,0 +1,90 @@
+# Hardware results: Pi and ComfyUI sharing one GPU
+
+One row per machine and run. A result counts for that machine and setup only: one card passing says nothing
+about others. Labels: **real** = ran on that hardware; **simulated** = fake servers or a big card held down to
+act like a small one. How to run: [examples/pi-local/README.md](../examples/pi-local/README.md). Pinned
+versions: [examples/pi-local/versions.json](../examples/pi-local/versions.json).
+
+## Status (2026-11-27)
+
+| Machine | GPU | Router probe | Pilot (2 cycles) | 20 cycles | Timeout, crash, memory checks |
+|---|---|---|---|---|---|
+| arch3090 | RTX 3090 24 GB, Ampere | **pass** (real, 2026-11-27) | **pass** krea2 2/2, qwen-edit 2/2 (real) | waiting for review | not run |
+| arch5090 | RTX 5090 32 GB, Blackwell | not run | not run | not run | not run |
+| Legion | RTX 3070 Laptop 8 GB | M2 | M2 | M2 | M2 |
+| metro-a5000 | RTX A5000 24 GB, 15 GB RAM | M2 | M2 | M2 | M2 |
+| AMD, Intel, Apple, Windows | none available | | | | |
+
+## Simulated checks (no GPU)
+
+### Pi 1.6.1 MCP timeout and unloaded model, 2026-11-27, cloud container
+
+Real Pi 1.6.1 (`@earendil-works/pi-coding-agent`), fake OpenAI-compatible server and fake slow MCP server
+(`examples/pi-local/probes/probe_pi.py`). All six scenarios ran once.
+
+| Scenario | Result |
+|---|---|
+| 30 s tool call, `timeout: 10` | Tool error `MCP request timed out after 10000ms` at 10.0 s; Pi sent `notifications/cancelled`; server kept running and sent its result at 30 s (ignored); next model call immediately |
+| same, progress every 5 s | Completed at 30.0 s, no timeout |
+| timeout, then model unloaded | Model call got 400 `model is not loaded`; no retry; turn ended with the error; provider stayed `local` |
+| two calls after a timeout, sequential server | Both timed out at 10 s (the second was blocked behind the first) |
+| 503 `Loading model` twice | Retried twice (2 s, 4 s backoff), then answered |
+| 400 on the first call | No retry, turn ended |
+
+### Pi 1.6.1 + the kit's handoff (PR #1 at db63579), whole fake stack, 2026-11-27, cloud container
+
+Real Pi in RPC mode, the real kit from branch `gpu-handoff-lifecycle` as Pi's MCP server with
+`inference.type=llama-router`, and the kit's own fakes (ComfyUI with memory books, router with autoload off)
+plus a scripted chat model that answers 400 while unloaded (`examples/pi-local/probes/sim_stack.py`), driven by
+`cycle_driver.py`.
+
+| Run | Result |
+|---|---|
+| 3 cycles, 3 s fake render, `timeout: 120` | 3/3 pass: one generate each, file on disk, follow-up named the seed, every reply from `local/qwen`. Sampler: 0 violations (source: router status, no nvidia-smi) |
+| 1 cycle, 75 s fake render, Pi `timeout: 60` | Pass. Render turn 76.8 s: the kit's 10 s progress kept Pi's call open past its 60 s timeout. No 400s reached Pi |
+
+This checks the driver, the sampler and the Pi/kit wiring. It says nothing about real load, unload or free
+timings, or real memory.
+
+## Real runs
+
+### arch3090, 2026-11-27 08:30 UTC: build blocked
+
+Linux 7.2.15-4-omarchy (Arch), RTX 3090 24576 MiB, driver 615.78.08 (CUDA 13.4 user-mode driver), gcc 16.2.1,
+Python 3.14.8. Before: 833 MiB used (idle test ComfyUI on :8199 at 256 MiB, plus the desktop), queue empty.
+`first-check.sh` stopped at the llama.cpp build: no `cmake`, no `nvcc`. Nothing loaded on the GPU; 833 MiB
+after. A user on a fresh Arch desktop needs `sudo pacman -S cmake cuda` before building, or a prebuilt
+llama-server. The script now checks for both up front and says so.
+
+### arch3090, 2026-11-27 ~09:00 UTC: router probe, pass
+
+No toolkit needed after all: llama.cpp `b12808`'s official prebuilt Linux CUDA 12.8 build (with its runtime
+libraries) runs as is; `llama-server --version`: 1.1.0-dev (build 12808, commit ed2153e70), GNU 13.3.0. Model
+sha256 OK. Router on :8080 with `start-router.sh`. Test ComfyUI 0.45.3 idle on :8199. `probe_router.py --rounds 3`:
+
+| Step | Result |
+|---|---|
+| Listed | `qwen38-27b` unloaded, `models_autoload` false |
+| Chat while unloaded | HTTP 400 `model is not loaded`, as expected; nothing loaded (833 MiB used) |
+| Load, 3 rounds | 3.8 s, 3.5 s, 3.8 s to `loaded`; first chat 0.4 s each |
+| Loaded footprint | 16,326 MiB used on the card (model + desktop + idle ComfyUI); ComfyUI saw 7,828 MiB free |
+| Unload, 2 rounds | 0.5 s each, back to 833 MiB used / 23,322 MiB free in ComfyUI |
+| After | router stopped, 833 MiB used, same as before |
+
+### arch3090, 2026-11-27 ~09:45 UTC: 2-cycle Pi pilots, pass
+
+Pi 1.6.1 in RPC mode, Qwen3.8-27B UD-Q3_K_XL 32K on the llama.cpp `b12808` router (`--no-models-autoload`), kit at
+`gpu-handoff-lifecycle` db63579 with `inference.type=llama-router`, ComfyUI 0.45.3, torch 2.11.0+cu128, driver
+615.78.08. `cycle_driver.py --pilot`; VRAM sampled every 0.5 s with nvidia-smi per process.
+
+| Recipe | Cycles | Peak VRAM (MiB) | Phases (avg) | Notes |
+|---|---|---|---|---|
+| krea2 (int8, local recipe) | 2/2 pass | 20,061 total; model 15,564, ComfyUI 19,452, never together while rendering; 0 violations | unload 0.5 s, render 29.6 s, free 0.5 s, restore 4.0 s | Turns 44 s and 54 s. Pi called `recipes` then `generate`; follow-up named the seed; every reply from local/qwen38-27b. Pictures checked: fox asleep in snow, lighthouse at dusk |
+| qwen-edit on a portrait | 2/2 (the summary said 1/2: checker bug, a two-digit seed; fixed) | 22,515 total; 0 violations | render ~104 s | Edits correct: night with full moon, then snow, same person kept |
+
+After: router stopped, 1,089 MiB used (the test ComfyUI's own process grew from 256 to 508 MiB after rendering).
+zimage not installed on arch3090: /home has 3 GB free.
+
+Load times are with the file in the OS page cache (second read onward); a cold first load will be slower. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
+recipe, kit commit, peak VRAM per side, co-residency violations, and time to unload, render, free and reload
+(from `ops --json`).

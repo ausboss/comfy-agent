@@ -1,0 +1,4 @@
+{
+ "defaultProvider": "local",
+ "defaultModel": "qwen38-27b"
+}

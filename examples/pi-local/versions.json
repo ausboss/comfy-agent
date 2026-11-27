@@ -1,0 +1,13 @@
+{
+ "_note": "Pinned for milestone 1 GPU runs. Change only with a new results row in docs/hardware-results.md.",
+ "llama.cpp": {"tag": "b12808", "commit": "ed2153e708de813c35559102aed43b3085179c27", "date": "2026-11-26",
+               "source": "https://github.com/ggml-org/llama.cpp/releases/tag/b12808",
+               "why": "router mode with --no-models-autoload, POST /models/load and /models/unload, GET /models status, read from this tag's tools/server source"},
+ "pi": {"package": "@earendil-works/pi-coding-agent", "version": "1.6.1", "date": "2026-11-25",
+        "why": "built-in MCP client (per-server timeout, progress resets it) and RPC mode; probed with probes/probe_pi.py"},
+ "model": {"repo": "unsloth/Qwen3.8-27B-GGUF", "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+           "file": "Qwen3.8-27B-UD-Q3_K_XL.gguf", "bytes": 13146393504,
+           "sha256": "7b20f0679da6f5c6ec7971e241630f44fe1e123e5c99bfea90c433268b355723",
+           "mmproj": "mmproj-F16.gguf", "context": 32768,
+           "why": "decision 2 of the M1 plan: known to drive Pi's tool calls"}
+}
