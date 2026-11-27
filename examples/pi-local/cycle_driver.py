@@ -195,6 +195,8 @@ def run_cycle(a, i, out):
         "followup_seed_matches": bool(seeds) and any(n in seeds for n in nums),
         "all_local": bool(msgs) and all(p.startswith(a.expect_provider + "/") for p in providers),
         "no_assistant_errors": not errors,
+        # the kit's runner notes "intrusion: ..." when something loaded the model while ComfyUI had the GPU
+        "no_intrusion": not any("intrusion" in str(n) for n in ((op or {}).get("notes") or [] if isinstance(op, dict) else [])),
     }
     rec = {"cycle": i, "subject": subject, "pass": all(checks.values()), "checks": checks,
            "render_turn_s": t1, "followup_turn_s": t2, "tool_calls": [(e.get("toolName"), e.get("isError"),
