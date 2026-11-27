@@ -1,0 +1,15 @@
+{
+ "providers": {
+  "local": {
+   "name": "llama.cpp (this computer)",
+   "baseUrl": "http://127.0.0.1:8080/v1",
+   "api": "openai-completions",
+   "apiKey": "none",
+   "models": [
+    {"id": "qwen38-27b", "name": "Qwen3.8 27B Q3 (local)", "reasoning": true, "input": ["text", "image"],
+     "contextWindow": 32768, "maxTokens": 8192,
+     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}
+   ]
+  }
+ }
+}
