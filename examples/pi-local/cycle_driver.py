@@ -188,7 +188,7 @@ def run_cycle(a, i, out):
     seeds = [str(j.get("seed")) for j in (op or {}).get("jobs", []) if isinstance(op, dict)]
     files = [f for j in (op or {}).get("jobs", []) for f in (j.get("files") or [])] if isinstance(op, dict) else []
     answer = text_of(msgs[-1]) if msgs else ""
-    nums = re.findall(r"\d{3,}", answer)
+    nums = re.findall(r"\d+", answer)
     checks = {
         "generate_once_ok": len(gens) == 1 and not gens[0].get("isError"),
         "file_exists": bool(files) and all(os.path.exists(f) or os.path.exists(Path(a.kit or ".") / f) for f in files),
