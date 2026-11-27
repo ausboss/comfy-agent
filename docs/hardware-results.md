@@ -9,7 +9,7 @@ versions: [examples/pi-local/versions.json](../examples/pi-local/versions.json).
 
 | Machine | GPU | Router probe | Pilot (2 cycles) | 20 cycles | Timeout, crash, memory checks |
 |---|---|---|---|---|---|
-| arch3090 | RTX 3090 24 GB, Ampere | blocked: no cmake or CUDA toolkit (2026-11-27) | not run | not run | not run |
+| arch3090 | RTX 3090 24 GB, Ampere | **pass** (real, 2026-11-27) | not run | not run | not run |
 | arch5090 | RTX 5090 32 GB, Blackwell | not run | not run | not run | not run |
 | Legion | RTX 3070 Laptop 8 GB | M2 | M2 | M2 | M2 |
 | metro-a5000 | RTX A5000 24 GB, 15 GB RAM | M2 | M2 | M2 | M2 |
@@ -56,6 +56,21 @@ Python 3.14.8. Before: 833 MiB used (idle test ComfyUI on :8199 at 256 MiB, plus
 after. A user on a fresh Arch desktop needs `sudo pacman -S cmake cuda` before building, or a prebuilt
 llama-server. The script now checks for both up front and says so.
 
-None of the measured runs below exist yet. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
+### arch3090, 2026-11-27 ~09:00 UTC: router probe, pass
+
+No toolkit needed after all: llama.cpp `b12808`'s official prebuilt Linux CUDA 12.8 build (with its runtime
+libraries) runs as is; `llama-server --version`: 1.1.0-dev (build 12808, commit ed2153e70), GNU 13.3.0. Model
+sha256 OK. Router on :8080 with `start-router.sh`. Test ComfyUI 0.45.3 idle on :8199. `probe_router.py --rounds 3`:
+
+| Step | Result |
+|---|---|
+| Listed | `qwen38-27b` unloaded, `models_autoload` false |
+| Chat while unloaded | HTTP 400 `model is not loaded`, as expected; nothing loaded (833 MiB used) |
+| Load, 3 rounds | 3.8 s, 3.5 s, 3.8 s to `loaded`; first chat 0.4 s each |
+| Loaded footprint | 16,326 MiB used on the card (model + desktop + idle ComfyUI); ComfyUI saw 7,828 MiB free |
+| Unload, 2 rounds | 0.5 s each, back to 833 MiB used / 23,322 MiB free in ComfyUI |
+| After | router stopped, 833 MiB used, same as before |
+
+Load times are with the file in the OS page cache (second read onward); a cold first load will be slower. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
 recipe, kit commit, peak VRAM per side, co-residency violations, and time to unload, render, free and reload
 (from `ops --json`).

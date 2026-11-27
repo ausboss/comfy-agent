@@ -12,7 +12,9 @@ Results per machine go in [docs/hardware-results.md](../../docs/hardware-results
 
 ## Set up
 
-1. Build or install llama.cpp at the pinned tag (CUDA example; use the matching backend on other GPUs):
+1. Get llama.cpp at the pinned tag. On Linux with NVIDIA, the release's prebuilt CUDA 12.8 build (it ships its
+   CUDA runtime libraries) worked on arch3090 without a CUDA toolkit. Or build it (CUDA example; use the matching
+   backend on other GPUs):
    `git clone --branch b12808 --depth 1 https://github.com/ggml-org/llama.cpp && cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON && cmake --build llama.cpp/build -j --target llama-server`
 2. Put the model in `~/models/pi-local/Qwen3.8-27B-UD-Q3_K_XL/` (the `.gguf` and `mmproj-F16.gguf`).
 3. Start the router: `./start-router.sh`, then load the model once:
