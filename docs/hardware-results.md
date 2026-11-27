@@ -31,6 +31,21 @@ Real Pi 1.6.1 (`@earendil-works/pi-coding-agent`), fake OpenAI-compatible server
 | 503 `Loading model` twice | Retried twice (2 s, 4 s backoff), then answered |
 | 400 on the first call | No retry, turn ended |
 
+### Pi 1.6.1 + the kit's handoff (PR #1 at db63579), whole fake stack, 2026-11-27, cloud container
+
+Real Pi in RPC mode, the real kit from branch `gpu-handoff-lifecycle` as Pi's MCP server with
+`inference.type=llama-router`, and the kit's own fakes (ComfyUI with memory books, router with autoload off)
+plus a scripted chat model that answers 400 while unloaded (`examples/pi-local/probes/sim_stack.py`), driven by
+`cycle_driver.py`.
+
+| Run | Result |
+|---|---|
+| 3 cycles, 3 s fake render, `timeout: 120` | 3/3 pass: one generate each, file on disk, follow-up named the seed, every reply from `local/qwen`. Sampler: 0 violations (source: router status, no nvidia-smi) |
+| 1 cycle, 75 s fake render, Pi `timeout: 60` | Pass. Render turn 76.8 s: the kit's 10 s progress kept Pi's call open past its 60 s timeout. No 400s reached Pi |
+
+This checks the driver, the sampler and the Pi/kit wiring. It says nothing about real load, unload or free
+timings, or real memory.
+
 ## Real runs
 
 None yet. Each run records: OS, driver, ComfyUI version, Pi, llama.cpp build, model file and quant, context,
