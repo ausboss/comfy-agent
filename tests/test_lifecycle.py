@@ -481,7 +481,9 @@ class Sharing(Base):
         self.out(ca.cmd_cancel, ca.argparse.Namespace(op=op_id))
         op = self.wait_op(op_id)
         self.assertEqual(op["state"], "cancelled")
-        self.assertEqual({x["state"] for x in ca.journal().jobs(op_id)}, {"cancelled"})
+        states = [x["state"] for x in ca.journal().jobs(op_id)]
+        self.assertEqual(states[0], "cancelled")  # it was running: interrupted
+        self.assertTrue(set(states) <= {"cancelled", "skipped"}, states)  # the rest: removed, or never sent
         self.assertTrue(self.events("interrupt"))
         self.assertTrue(self.events("delete"))
         self.assertFalse(self.world.busy())

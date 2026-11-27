@@ -255,7 +255,7 @@ class ComfyAgentTest(unittest.TestCase):
 
     def test_small_card_mode_unloads_the_llm_first_and_frees_comfyui_after(self):
         marker = Path(self.tmp.name) / "unloaded"
-        ca.S["unload_llm"] = f"{sys.executable} -c \"open('{marker}', 'w')\""
+        ca.S["unload_llm"] = f"\"{sys.executable}\" -c \"open('{marker.as_posix()}', 'w')\""
         Fake.frees.clear()
         try:
             ca.cmd_run(ca.argparse.Namespace(recipe=str(self.recipe_dir), values=["prompt=x"], count=2, set=None,

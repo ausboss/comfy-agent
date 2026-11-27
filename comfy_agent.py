@@ -843,6 +843,9 @@ class Runner:
         self.j.append(self.id, "events", [time.time(), text])
 
     def state(self, state, **kw):
+        if state in OP_FINAL and self.lease.fd is not None:
+            self._final = dict(state=state, **kw)  # written after the lease is released, so "done" means free
+            return
         self.j.set_op(self.id, state=state, **kw)
 
     def cancelled(self):
@@ -944,6 +947,9 @@ class Runner:
         finally:
             if held:
                 self.lease.release()
+            final = getattr(self, "_final", None)
+            if final:
+                self.j.set_op(self.id, **final)
             self._stop.set()
 
     def unload(self):
@@ -1658,7 +1664,7 @@ def install_pack(pack, custom_nodes):
             repo = json.load(r).get("repository")
     if not repo:
         raise Fail(f"No download address for node pack {pack.get('id')}.")
-    name = repo.rstrip("/").rsplit("/", 1)[-1]
+    name = re.split(r"[\\/]", repo.rstrip("/\\"))[-1]
     dest = custom_nodes / (name[:-4] if name.endswith(".git") else name)
     if not dest.exists():
         subprocess.run(["git", "clone", "--depth", "1", repo, str(dest)], check=True)
